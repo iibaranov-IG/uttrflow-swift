@@ -38,6 +38,42 @@ struct SettingsShortcutDrawingTests {
         #expect(SettingsShortcut.keycaps(for: .optionSpace) == ["⌥", "Space"])
     }
 
+    /// A chord of modifiers stored under one of its own keys, and the caps it draws as.
+    struct ModifierChord: Sendable, CustomTestStringConvertible {
+        let keyCode: UInt16
+        let modifiers: Set<HotkeyModifier>
+        let drawn: [String]
+        var testDescription: String { "key \(keyCode) drawn as \(drawn.joined())" }
+    }
+
+    static let modifierChords: [ModifierChord] = [
+        ModifierChord(keyCode: 58, modifiers: [.option, .command, .control], drawn: ["⌃", "⌥", "⌘"]),
+        ModifierChord(keyCode: 61, modifiers: [.option, .control], drawn: ["⌃", "⌥"]),
+        ModifierChord(keyCode: 55, modifiers: [.command, .shift], drawn: ["⇧", "⌘"]),
+        ModifierChord(
+            keyCode: 54, modifiers: [.command, .option, .shift, .control], drawn: ["⌃", "⌥", "⇧", "⌘"]),
+        ModifierChord(keyCode: 59, modifiers: [.control, .option], drawn: ["⌃", "⌥"]),
+        ModifierChord(keyCode: 62, modifiers: [.control, .command], drawn: ["⌃", "⌘"]),
+        ModifierChord(keyCode: 56, modifiers: [.shift, .option], drawn: ["⌥", "⇧"]),
+        ModifierChord(keyCode: 60, modifiers: [.shift, .control], drawn: ["⌃", "⇧"]),
+    ]
+
+    /// Issue 353: a chord of modifiers drew only the key it was stored under, so ⌃⌥⌘ read as ⌥.
+    @Test(
+        "draws every modifier of a chord made only of modifiers, each once and in order",
+        arguments: modifierChords)
+    func drawsAModifierChord(chord: ModifierChord) {
+        let binding = HotkeyBinding(keyCode: chord.keyCode, modifiers: chord.modifiers)
+        #expect(SettingsShortcut.keycaps(for: binding) == chord.drawn)
+        #expect(SettingsShortcut.compact(binding) == chord.drawn.joined())
+    }
+
+    @Test("draws a chord's key modifier even when the stored set leaves it out")
+    func drawsTheKeysOwnModifier() {
+        let binding = HotkeyBinding(keyCode: 58, modifiers: [.control, .command])
+        #expect(SettingsShortcut.keycaps(for: binding) == ["⌃", "⌥", "⌘"])
+    }
+
     @Test("shows a key it has no name for as its code rather than as nothing")
     func namesTheUnnameable() {
         #expect(SettingsShortcut.name(of: 200) == "Key 200")
@@ -116,16 +152,12 @@ struct SettingsShortcutRecorderTests {
         #expect(SettingsShortcut.compact(.functionHold) == "fn")
     }
 
-    /// Whether ⌘ alone is wise is the owner's choice; whether it can be delivered is this code's, and it can.
-    @Test("accepts a modifier pressed on its own, and any combination of them")
+    /// A chord of modifiers is matched by equality, so ⌃⌥ held does not fire on the way to a ⌃⌥ shortcut's key.
+    @Test("accepts any combination of modifiers held together")
     func heldModifiersAreAccepted() {
         for (keyCode, modifiers) in [
-            (UInt16(55), Set<HotkeyModifier>([.command])),
-            (UInt16(58), Set([.option])),
-            (UInt16(59), Set([.control])),
-            (UInt16(56), Set([.shift])),
             // The combination this was all about.
-            (UInt16(58), Set([.control, .option])),
+            (UInt16(58), Set<HotkeyModifier>([.control, .option])),
             (UInt16(55), Set([.command, .option])),
             (UInt16(59), Set([.control, .option, .command])),
         ] {
@@ -138,6 +170,23 @@ struct SettingsShortcutRecorderTests {
                 continue
             }
             Issue.record("\(modifiers) was refused: \(rejection.reason)")
+        }
+    }
+
+    /// Issue 342: one of these alone is part of every shortcut that uses it, so the field refuses it and keeps listening.
+    @Test("refuses a modifier pressed on its own and keeps the previous shortcut")
+    func bareModifiersAreRefused() {
+        for (keyCode, modifiers) in [
+            (UInt16(55), Set<HotkeyModifier>([.command])), (UInt16(58), Set([.option])),
+            (UInt16(59), Set([.control])), (UInt16(56), Set([.shift])), (UInt16(61), Set()),
+        ] {
+            var recorder = SettingsShortcutRecorder(binding: .optionSpace)
+            recorder.beginRecording()
+            let outcome = recorder.record(keyCode: keyCode, modifiers: modifiers)
+
+            #expect(outcome == .refused(SettingsRejection(reason: SettingsEditor.bareModifier)), "\(keyCode)")
+            #expect(recorder.binding == .optionSpace)
+            #expect(recorder.isRecording)
         }
     }
 
@@ -182,12 +231,13 @@ struct SettingsShortcutRecorderTests {
             #expect(r.binding == .functionHold)
         }
 
-        @Test("single modifier held alone")
+        @Test("single modifier held alone is refused")
         func singleModifier() {
             var r = recorder()
             _ = r.receive(held([.command], key: 55))
             _ = r.receive(held([]))
-            #expect(r.binding == HotkeyBinding(keyCode: 55, modifiers: [.command]))
+            #expect(r.binding == .optionSpace)
+            #expect(r.rejection == SettingsEditor.bareModifier)
         }
 
         @Test("a modifier let go never becomes the shortcut")
@@ -280,15 +330,14 @@ struct SettingsShortcutRecorderTests {
             #expect(r.binding == .functionHold)
         }
 
-        /// One modifier held on its own, which is a shortcut in its own right.
-        @Test("single modifier held alone")
+        /// One modifier held on its own is part of every shortcut using it, so it is the one shape refused.
+        @Test("single modifier held alone is refused")
         func singleModifier() {
             var r = SettingsShortcutRecorder(binding: .functionHold)
             r.beginRecording()
             _ = r.hold(keyCode: 55, modifiers: [.command])
-            #expect(
-                r.release()
-                    == .recorded(.shortcut(.dictate, HotkeyBinding(keyCode: 55, modifiers: [.command]))))
+            #expect(r.release() == .refused(SettingsRejection(reason: SettingsEditor.bareModifier)))
+            #expect(r.binding == .functionHold)
         }
 
         /// One modifier and one key: the combination that could not be typed at all.

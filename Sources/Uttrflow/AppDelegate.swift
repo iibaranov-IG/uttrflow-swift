@@ -12,6 +12,7 @@ import UttrflowInput
 import UttrflowPermissions
 import UttrflowPipeline
 import UttrflowPredict
+import UttrflowPredictCapture
 import UttrflowPredictStore
 import UttrflowSettings
 import UttrflowSpeech
@@ -53,6 +54,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// Whether the recogniser can dictate, which is not whether its files are on disk.
     private var speechReadiness: SpeechModelReadiness = .notInstalled
+    /// When the load under way began, so the estimate is said only once a load has run long enough to need it.
+    private var speechLoadStarted: ContinuousClock.Instant?
+
+    /// The load as every dictation surface tells it, read from ``speechReadiness`` and nothing else.
+    private var speechModelLoad: SpeechModelLoad? {
+        speechReadiness.load(since: speechLoadStarted, now: ContinuousClock.now)
+    }
 
     /// How the recording in progress is going against ``DictationLimit``.
     private var recordingAdvice: DictationAdvice = .keepGoing
@@ -78,8 +86,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let generating: (any CandidateGenerating)?
     /// Fetches and loads that model's weights, reporting progress, run when tab-to-complete is first built.
     private let prepareModel: (@Sendable (@escaping @Sendable (Double) -> Void) async throws -> Void)?
-    /// Whether the weights have been asked for already, so turning the feature off and on does not ask twice.
+    /// Frees that model's weights, run when tab-to-complete is turned off.
+    private let releaseModel: (@Sendable () async -> Void)?
+    /// Whether the weights have been asked for and not let go since, so turning the feature on twice does not ask twice.
     private var isModelPreparing = false
+    /// Counts each ask and each release, so a load that lands after the feature was turned off reports nothing.
+    private var modelAsk = 0
+    /// The latest fetch of those weights, internal so a test can wait for it rather than for the clock.
+    private(set) var modelPreparation: Task<Void, Never>?
+    /// When the suggestion model gives memory back and takes it again; internal so a test can shorten the waits.
+    var memoryPressure = SuggestionModelPressure()
+    /// The reload waiting for memory to stay calm, cancelled by the next reading; internal so a test can wait for it.
+    private(set) var pressureReload: Task<Void, Never>?
+    private let pressureSource = MemoryPressureSource()
     /// Which clean-up engines answered that they could run; internal so a test can read it back.
     private(set) var transformerAvailability: [TransformerKind: Bool] = [:]
 
@@ -95,13 +114,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     init(
         container: URL = .applicationSupportDirectory, loginItem: LaunchAtLogin = LaunchAtLogin(),
         scoring: (any CandidateScoring)? = nil, generating: (any CandidateGenerating)? = nil,
-        prepareModel: (@Sendable (@escaping @Sendable (Double) -> Void) async throws -> Void)? = nil
+        prepareModel: (@Sendable (@escaping @Sendable (Double) -> Void) async throws -> Void)? = nil,
+        releaseModel: (@Sendable () async -> Void)? = nil
     ) {
         self.container = container
         self.loginItem = loginItem
         self.scoring = scoring
         self.generating = generating
         self.prepareModel = prepareModel
+        self.releaseModel = releaseModel
         history = DictationHistoryStore(file: DictationHistoryStore.defaultFile(in: container))
         recordings = RecordingStore(directory: RecordingStore.defaultDirectory(in: container))
         dictionary = PersonalDictionaryStore(
@@ -149,6 +170,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var noticeTask: Task<Void, Never>?
     /// The editor opening against the disk, kept so a caller can wait for it rather than poll for it.
     private(set) var openingEditor: Task<Void, Never>?
+    /// The store work the last main-window intent set going, so a test awaits it rather than a clock.
+    private(set) var intentWork: Task<Void, Never>?
     /// A3, A7 — where the user was when the panel closed, while reopening still counts as undoing.
     private var resume: PanelResume?
     /// Long enough to reach for the keyboard, short enough to not undo a forgotten delete.
@@ -160,7 +183,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private lazy var settingsWindow = SettingsWindowController(
         store: settingsStore,
         personalisation: FilePersonalisationStore(
-            dictionary: dictionary, history: history, clipboard: clipboard),
+            dictionary: dictionary, history: history, clipboard: clipboard,
+            met: { AppDelegate.applicationsTheLoopHasMet() }),
         onChange: { [weak self] settings in self?.settingsChanged(to: settings) },
         // Through the same switch the main window uses, so one choice is never applied two ways.
         onRequest: { [weak self] change in self?.apply(change) },
@@ -189,6 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         startWatchingForTheShortcut()
         startWatchingTheClipboard()
         startCompletingWhatIsTyped()
+        pressureSource.start { [weak self] in self?.memoryPressureChanged(to: $0) }
         loadSpeechModel()
         probeTransformers()
         refreshAccount()
@@ -205,6 +230,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         Task { [dictionary] in try? await dictionary.seedShippedWords(at: Date()) }
     }
 
+    /// Applications the completion loop has met, so the Suggestions list can offer a switch for each.
+    nonisolated static func applicationsTheLoopHasMet() -> Set<String> {
+        let file = CapturePreferencesFile(
+            path: CapturePreferencesFile.defaultFile(in: .applicationSupportDirectory)
+                .path(percentEncoded: false))
+        return Set(file.load().consent.keys)
+    }
+
+    /// Deletes a model that is on disk but will not load, and opens setup to download it again.
+    private func repairSpeechModel() {
+        try? modelStore.remove(.default)
+        speechReadiness = .notInstalled
+        refreshSpeechModelSurfaces()
+        show(.onboarding)
+    }
+
+    /// Loads a model that setup has just installed, so dictation works without a relaunch.
+    private func loadSpeechModelIfItArrived() {
+        guard speechReadiness == .notInstalled || speechReadiness == .loadFailed else { return }
+        loadSpeechModel()
+    }
+
     /// Loads the recogniser, saying so until it can dictate. See `Docs/startup.md`.
     private func loadSpeechModel() {
         guard modelStore.isInstalled(.default) else {
@@ -212,13 +259,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         speechReadiness = .loading
-        refreshMenuBar()
+        speechLoadStarted = .now
+        refreshSpeechModelSurfaces()
+        // One redraw when the estimate is due, so a load that is still going starts giving the minutes.
+        Task { [weak self] in
+            try? await Task.sleep(for: SpeechModelLoad.estimateAfter)
+            guard let self, speechReadiness == .loading else { return }
+            refreshSpeechModelSurfaces()
+        }
         Task { [weak self] in
             await self?.pipeline?.prepare()
             guard let self, let pipeline else { return }
-            speechReadiness = await pipeline.isReady ? .ready : .notInstalled
-            refreshMenuBar()
+            let isReady = await pipeline.isReady
+            speechReadiness =
+                isReady ? .ready : modelStore.isInstalled(.default) ? .loadFailed : .notInstalled
+            refreshSpeechModelSurfaces()
         }
+    }
+
+    /// Redraws everywhere a person might try to dictate, from the load as it stands.
+    private func refreshSpeechModelSurfaces() {
+        refreshMenuBar()
+        dock.update(with: dockPresentation(for: lastDictationState))
+        // Guarded here, since the redraw also wakes the updater, which launch starts last on purpose.
+        if mainWindow != nil { redrawMainWindow() }
+    }
+
+    /// The floating button for a state, with the speech model's load drawn in.
+    private func dockPresentation(for state: DictationState) -> DockPresentation {
+        DictationPresenter.dock(for: state, advice: recordingAdvice, speechModel: speechModelLoad)
     }
 
     /// Asks each clean-up engine whether it could run, so Diagnostics has an answer to show.
@@ -292,7 +361,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             refreshMainWindow()
         }
         // However the window goes, including the red button, which changes the Account page.
-        onboarding.onClose = { [weak self] in self?.refreshMainWindow() }
+        onboarding.onClose = { [weak self] in
+            self?.refreshMainWindow()
+            self?.loadSpeechModelIfItArrived()
+        }
         onboarding.present(skippingWelcome: skippingWelcome, askingToSignIn: askingToSignIn)
     }
 
@@ -321,6 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         stateTask?.cancel()
         dismissalTask?.cancel()
         completions?.stop()
+        pressureSource.stop()
     }
 
     /// Builds tab-to-complete, or leaves it unbuilt, which is what everybody who has not asked for it gets.
@@ -351,16 +424,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let report: @Sendable (Double) -> Void = { [weak self] fraction in
             Task { @MainActor in self?.suggestionModelProgressed(fraction) }
         }
-        Task { [weak self] in
+        modelAsk += 1
+        let ask = modelAsk
+        let previous = modelPreparation
+        modelPreparation = Task { [weak self] in
+            // After the release before it, so a quick off and on never frees the weights it just loaded.
+            await previous?.value
             do {
                 try await prepareModel(report)
+                guard self?.modelAsk == ask else { return }
                 self?.suggestionModel = .ready
             } catch {
                 Self.log.error(
                     "the suggestion model did not load: \(String(describing: error), privacy: .public)")
+                guard self?.modelAsk == ask else { return }
                 // Cleared, so turning the feature off and on tries again rather than staying dead all launch.
                 self?.isModelPreparing = false
                 self?.suggestionModel = .failed
+            }
+        }
+    }
+
+    /// Lets the weights go once the feature is off, after any load still in flight. See `Docs/performance.md`.
+    private func releaseTheModel() {
+        guard isModelPreparing || suggestionModel == .failed else { return }
+        isModelPreparing = false
+        modelAsk += 1
+        suggestionModel = .notAsked
+        let previous = modelPreparation
+        let releaseModel = releaseModel
+        modelPreparation = Task {
+            await previous?.value
+            await releaseModel?()
+        }
+    }
+
+    /// Releases the suggestion model when memory is pressed, and loads it again once calm has lasted. See `Docs/performance.md`.
+    func memoryPressureChanged(to level: MemoryPressureLevel) {
+        pressureReload?.cancel()
+        pressureReload = nil
+        switch level {
+        case .warning, .critical:
+            guard settings.suggestions.isEnabled, isModelPreparing else { return }
+            memoryPressure.released(at: .now)
+            releaseTheModel()
+            suggestionModel = .releasedForMemory
+        case .normal:
+            guard memoryPressure.isReleased else { return }
+            let wait = memoryPressure.wait
+            pressureReload = Task { [weak self] in
+                try? await Task.sleep(for: wait)
+                guard !Task.isCancelled, let self, memoryPressure.isReleased,
+                    settings.suggestions.isEnabled
+                else { return }
+                memoryPressure.reloaded(at: .now)
+                prepareTheModelIfNeeded()
             }
         }
     }
@@ -376,6 +494,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard settings.suggestions.isEnabled else {
             completions?.stop()
             completions = nil
+            memoryPressure.forget()
+            pressureReload?.cancel()
+            releaseTheModel()
             return
         }
         guard let completions else { return startCompletingWhatIsTyped() }
@@ -463,7 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         guard advice != recordingAdvice else { return }
         recordingAdvice = advice
         refreshMenuBar()
-        dock.update(with: DictationPresenter.dock(for: lastDictationState, advice: advice))
+        dock.update(with: dockPresentation(for: lastDictationState))
     }
 
     private func wireInterface() {
@@ -544,7 +665,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let arrived: @Sendable (NoticedClip) async -> Void = { [weak self] noticed in
             await self?.clipArrived(noticed)
         }
-        clipboardWatchTask = Task { [clipboardWatcher] in
+        // Utility, because a poll nobody is waiting on should not run as the main thread's work.
+        clipboardWatchTask = Task(priority: .utility) { [clipboardWatcher] in
             await clipboardWatcher.run(handing: arrived)
         }
 
@@ -553,9 +675,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// Keeps a clip the user has just copied, and shows it if they are looking.
     private func clipArrived(_ noticed: NoticedClip) async {
-        // Best-effort: a refused write loses one clip, and giving up would lose all the rest.
-        _ = try? await clipboard.record(noticed, keeping: retention)
+        await keep(noticed)
         await refreshPanelIfOpen()
+    }
+
+    /// Records one noticed clip; a refused write loses that clip, and giving up would lose all the rest.
+    private func keep(_ noticed: NoticedClip) async {
+        _ = try? await clipboard.record(noticed, keeping: retention)
     }
 
     /// One registration per claimed shortcut; a refusal is logged rather than shown as a dictation failure.
@@ -634,6 +760,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             closeQuickPanel()
             return
         }
+        // A copy made since the last poll is taken now, so the panel never opens without it.
+        await clipboardWatcher.catchUp { [weak self] noticed in await self?.keep(noticed) }
         let clips = await clipboard.clips(keeping: retention)
         let placement = await placement()
         // Built fresh, so a revealed secret cannot outlive the panel that revealed it.
@@ -685,10 +813,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return .unavailable(.microphoneNotGranted)
         }
         // The same question the menu bar asks: loaded, not merely on disk.
-        guard speechReadiness == .ready else {
-            return .unavailable(.modelNotReady(percent: nil))
+        switch speechReadiness {
+        case .ready: return .ready
+        case .loading: return .unavailable(.modelLoading)
+        case .downloading, .loadFailed, .notInstalled: return .unavailable(.modelNotReady(percent: nil))
         }
-        return .ready
     }
 
     /// A8 — answers a keystroke, noting first whether the application underneath has quit.
@@ -768,13 +897,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             _ = try await clipboard.delete(id, keeping: retention)
             await startForgettingTheUndo()
         case .create(let text):
-            // Detected here: the panel knows what was typed, not what a string is.
-            let kind = ClipKindDetector.kind(of: text)
+            // Detected here, off the main actor: the panel knows what was typed, not what a string is.
+            let classified = await ClipKindDetector.classify(text)
             let clip = Clip(
-                text: text, kind: kind, copiedAt: Date(), source: nil,
+                text: text, kind: classified.kind, copiedAt: Date(), source: nil,
                 // Typed into the panel and kept, so it belongs with what the app made.
                 origin: .uttrflow,
-                language: kind == .code ? CodeLanguage.detect(text) : nil)
+                language: classified.language)
             _ = try await clipboard.record(clip, keeping: retention)
         case .rewriteText(let id, let tidied):
             _ = try await clipboard.setText(tidied, of: id, keeping: retention)
@@ -931,12 +1060,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func recordAsClip(_ text: String) {
         Task { [clipboard] in
-            let kind = ClipKindDetector.kind(of: text)
+            let classified = await ClipKindDetector.classify(text)
             let clip = Clip(
-                text: text, kind: kind, copiedAt: Date(), source: ClipOrigin.dictationSource,
+                text: text, kind: classified.kind, copiedAt: Date(), source: ClipOrigin.dictationSource,
                 // Which keeps it out of History, where it would be the newest thing every time.
                 origin: .uttrflow,
-                language: kind == .code ? CodeLanguage.detect(text) : nil)
+                language: classified.language)
             _ = try? await clipboard.record(clip, keeping: retention)
             await refreshPanelIfOpen()
         }
@@ -1057,7 +1186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // Cleared as soon as the recording ends, so a countdown cannot outlive it.
         if !state.isListening { recordingAdvice = .keepGoing }
         menuBar.update(with: MenuBarPresenter.present(menuBarState(for: state)))
-        dock.update(with: DictationPresenter.dock(for: state, advice: recordingAdvice))
+        dock.update(with: dockPresentation(for: state))
         refreshMainWindow()
 
         scheduleDismissal(after: state)
@@ -1272,7 +1401,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                     local: knownLocalAccount,
                     // The name macOS knows, read here so a test decides who is greeted.
                     systemName: NSFullUserName(),
-                    shortcut: shortcut, settings: settings, now: now)),
+                    shortcut: shortcut, settings: settings, now: now,
+                    speechModel: speechModelLoad)),
             sidebar: SidebarPresenter.sidebar(
                 for: SidebarSnapshot(
                     // The page the window shows; Settings is a window and lights nothing.
@@ -1484,7 +1614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         case .undoCorrection(let id):
             // In order: the history decides there was something to undo before the dictionary hears of it.
             let retention = Retention(days: settings.transcriptRetentionDays, now: Date())
-            Task { [weak self] in
+            intentWork = Task { [weak self] in
                 guard let self,
                     let entryID = try? await history.undoCorrection(id, keeping: retention)
                 else { return }
@@ -1516,7 +1646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// Runs a store change and redraws from what the store then holds, never from what it returned.
     private func act(_ change: @escaping () async throws -> Void) {
-        Task { [weak self] in
+        intentWork = Task { [weak self] in
             do {
                 try await change()
             } catch {
@@ -1536,7 +1666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func saveWord(_ word: String, pronunciation: String) {
-        Task { [weak self] in
+        intentWork = Task { [weak self] in
             guard let self else { return }
             do throws(DictionaryStoreError) {
                 try await dictionary.add(word: word, pronunciation: pronunciation, at: Date())
@@ -1560,7 +1690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// Saves a snippet, closing the editor only once it is in, as saving a word does.
     private func saveSnippet(trigger: String, text: String, replacing: UUID?) {
-        Task { [weak self] in
+        intentWork = Task { [weak self] in
             guard let self else { return }
             do throws(SnippetStoreError) {
                 try await snippets.save(
@@ -1674,9 +1804,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         switch action {
         case .openSystemSettings(let pane):
             Task { await openSettingsPane(pane) }
+        // A failed load is retried by loading again, since a dictation would only repeat the wait.
+        case .retry where speechReadiness == .loadFailed:
+            loadSpeechModel()
         case .retry:
             // A toggle, not a synthesised keypress with no release to close it.
             Task { [weak self] in await self?.controller?.toggleFromControl() }
+        case .downloadSpeechModel where speechReadiness == .loadFailed:
+            repairSpeechModel()
         case .downloadSpeechModel:
             // Installing a model needs a window to show progress in. It has one now.
             show(.settings(.dictation))

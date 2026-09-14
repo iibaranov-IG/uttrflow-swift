@@ -29,12 +29,19 @@ public struct MeaningPreservationGuard: Sendable {
     /// Makes a guard; it holds no state.
     public init() {}
 
-    /// Judges the rewrite against the kept words, the readings offered, the echo a pass took back, and the layout allowed.
+    /// Judges the rewrite against the kept words, the words a pass took out beyond its grant, the readings offered, the echo a pass took back, and the layout allowed.
     public func verdict(
         draft: Draft, rewritten: String, offering doubtful: [DoubtfulSpan] = [], echoed: String = "",
-        layout: LayoutPolicy = [.paragraphs, .lists]
+        layout: LayoutPolicy = [.paragraphs, .lists],
+        grants: [PassID: RemovalGrant] = CleaningPipeline.standard.grants
     ) -> GuardVerdict {
         if case .rejected(let reason) = verdict(original: draft.text, rewritten: rewritten) {
+            return .rejected(reason: reason)
+        }
+        let restored = Self.restored(RemovalAudit.unauthorised(in: draft, grants: grants))
+        if case .rejected(let reason) = Self.removalVerdict(
+            restored, kept: draft.text, rewritten: rewritten, echoed: echoed)
+        {
             return .rejected(reason: reason)
         }
         let alignment = RewriteAlignment(kept: draft.text, rewritten: rewritten)
@@ -48,15 +55,56 @@ public struct MeaningPreservationGuard: Sendable {
             return .rejected(reason: reason)
         }
         return Self.grammarVerdict(
-            alignment, excusing: readings.excused, echoed: echoed, allowing: doubtful)
+            alignment, excusing: readings.excused, echoed: echoed, allowing: doubtful,
+            restoring: restored.map(\.token))
+    }
+
+    /// The content words and negations among removals no grant covers, each with the pass that took it.
+    static func restored(_ removals: [UnauthorisedRemoval]) -> [(pass: PassID, token: GrammarToken)] {
+        removals.flatMap { removal in
+            grammarTokens(removal.text)
+                .filter { $0.isPlain && (isContent($0) || negatingWords.contains($0.matching)) }
+                .map { (removal.pass, $0) }
+        }
+    }
+
+    /// Refuses a rewrite that leaves out a word a pass removed without the grant to, since the passes alone cannot answer for it.
+    static func removalVerdict(
+        _ restored: [(pass: PassID, token: GrammarToken)], kept: String, rewritten: String, echoed: String
+    ) -> GuardVerdict {
+        let written = (grammarTokens(echoed) + grammarTokens(rewritten)).filter(\.isPlain)
+        var negations = negators(in: grammarTokens(kept))
+        for (pass, token) in restored {
+            let isNegation = negatingWords.contains(token.matching)
+            if isNegation { negations += 1 }
+            let present =
+                isNegation
+                ? negators(in: written) >= negations
+                : written.contains { survives(token.matching, as: $0) }
+            guard present else {
+                return .rejected(
+                    reason: "the \(pass) step took out '\(token.text)' and the rewrite does not put it back")
+            }
+        }
+        return .accepted
+    }
+
+    /// The readings the rewrite wrote where a doubtful run stood, so the entries that taught them are counted used.
+    public func readingsTaken(
+        draft: Draft, rewritten: String, offering doubtful: [DoubtfulSpan]
+    ) -> [Reading] {
+        guard !doubtful.isEmpty else { return [] }
+        return Self.readingVerdict(doubtful, in: RewriteAlignment(kept: draft.text, rewritten: rewritten))
+            .taken
     }
 
     /// A doubtful run may be written where it stands as it was heard or as a reading offered for it, inflected or not, and as nothing else.
     static func readingVerdict(
         _ doubtful: [DoubtfulSpan], in alignment: RewriteAlignment
-    ) -> (verdict: GuardVerdict, excused: Set<Int>) {
+    ) -> (verdict: GuardVerdict, excused: Set<Int>, taken: [Reading]) {
         var excused: Set<Int> = []
-        guard !doubtful.isEmpty else { return (.accepted, excused) }
+        var taken: [Reading] = []
+        guard !doubtful.isEmpty else { return (.accepted, excused, taken) }
         for span in doubtful {
             for place in alignment.keptRuns(spelled: DoubtfulSpan.closedUp(span.heard)) {
                 let touched = alignment.changes.filter { $0.kept.overlaps(place) }
@@ -68,21 +116,41 @@ public struct MeaningPreservationGuard: Sendable {
                 let before = alignment.keptSpelling(of: start..<place.lowerBound)
                 let after = alignment.keptSpelling(of: place.upperBound..<end)
                 // The rewrite may inflect the run it was given — "payment sheets" for "payment sheet" — and change it no further.
-                let offered = ([span.heard] + span.candidates).flatMap { reading in
+                func writes(_ reading: String) -> Bool {
                     let wanted = DoubtfulSpan.closedUp(reading)
                     return inflections(of: wanted).union([wanted]).map { before + $0 + after }
+                        .contains(alignment.standing(in: start..<end))
                 }
-                guard offered.contains(alignment.standing(in: start..<end)) else {
+                let offered = span.candidates.filter { writes($0.spelling) }
+                guard writes(span.heard) || !offered.isEmpty else {
                     return (
                         .rejected(reason: "the rewrite read '\(span.heard)' as a word it was not offered"),
-                        excused
+                        excused, taken
                     )
+                }
+                if let reading = Self.reading(
+                    among: offered, heard: span.heard, standing: alignment.standingAsWritten(in: start..<end))
+                {
+                    taken.append(reading)
                 }
                 // A reading rightly written here is the one substitution the survival check must let past.
                 for change in touched { excused.formUnion(change.kept.clamped(to: place)) }
             }
         }
-        return (.accepted, excused)
+        return (.accepted, excused, taken)
+    }
+
+    /// The offered reading written in the run's place, told from the heard words by its capitals and spaces when it closes up alike.
+    private static func reading(
+        among offered: [Reading], heard: String, standing written: String
+    ) -> Reading? {
+        let asHeard = RewriteAlignment.asWritten(heard)
+        return offered.first { reading in
+            let spelled = RewriteAlignment.asWritten(reading.spelling)
+            // Capitals alone are what a sentence gives its first word, so they are no sign the model chose the reading.
+            guard spelled.lowercased() != asHeard.lowercased() else { return false }
+            return written.contains(spelled)
+        }
     }
 
     /// The same judgement over two texts, which is how a test states one.
@@ -227,7 +295,7 @@ public struct MeaningPreservationGuard: Sendable {
     /// The same check over an alignment already in hand, each word judged against what stands in its own place.
     static func grammarVerdict(
         _ alignment: RewriteAlignment, excusing excused: Set<Int>, echoed: String,
-        allowing doubtful: [DoubtfulSpan]
+        allowing doubtful: [DoubtfulSpan], restoring restored: [GrammarToken] = []
     ) -> GuardVerdict {
         let keptTokens = alignment.kept
         let rewrittenTokens = alignment.rewritten
@@ -251,7 +319,8 @@ public struct MeaningPreservationGuard: Sendable {
             return .rejected(reason: "the rewrite dropped a negation")
         }
         // The echo is the field's text before the caret, so it is an origin a negation may come from, never a total.
-        let added = negators(in: rewrittenTokens) - negators(in: keptTokens) - negators(in: echoTokens)
+        let added =
+            negators(in: rewrittenTokens) - negators(in: keptTokens) - negators(in: echoTokens + restored)
         if added > 0 {
             return .rejected(reason: "the rewrite added a negation")
         }
@@ -259,8 +328,9 @@ public struct MeaningPreservationGuard: Sendable {
         if churn > 3 * sentenceCount(alignment.rewrittenText) {
             return .rejected(reason: "the rewrite changed \(churn) small words")
         }
+        // A word put back where a pass took it without the grant to is the speaker's, not the model's.
         return inventionVerdict(
-            kept: keptTokens, rewritten: rewrittenTokens, echo: echoTokens, allowing: doubtful)
+            kept: keptTokens, rewritten: rewrittenTokens, echo: echoTokens + restored, allowing: doubtful)
     }
 
     /// Refuses a carried word that a changed run lost, judging it only against the words standing in that run's place.
@@ -290,7 +360,7 @@ public struct MeaningPreservationGuard: Sendable {
         let readings = Set(
             doubtful
                 .flatMap { $0.candidates }
-                .flatMap { $0.split(whereSeparator: \.isWhitespace) }
+                .flatMap { $0.spelling.split(whereSeparator: \.isWhitespace) }
                 .map { DoubtfulSpan.closedUp(String($0)) })
         for token in rewritten
         where token.isPlain && isContent(token) && !readings.contains(DoubtfulSpan.closedUp(token.text)) {

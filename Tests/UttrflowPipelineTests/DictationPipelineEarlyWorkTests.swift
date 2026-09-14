@@ -40,6 +40,59 @@ private actor NumberingSpeechEngine: SpeechEngine {
     var calls: Int { sampleCounts.count }
 }
 
+/// A recogniser whose first recognition does not finish until the test lets it, so the key can come up mid-recognition.
+private actor HeldSpeechEngine: SpeechEngine {
+    let kind = SpeechEngineKind.whisperKit
+    private(set) var calls = 0
+    private var held: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func prepare() async throws(SpeechEngineError) {}
+
+    func transcribe(
+        _ audio: AudioSamples, options: TranscriptionOptions
+    ) async throws(SpeechEngineError) -> Transcription {
+        calls += 1
+        if calls == 1, !released { await withCheckedContinuation { held = $0 } }
+        return Transcription(
+            text: "w\(calls) x", detectedLanguage: DetectedLanguage(code: .english, confidence: 1),
+            audioDuration: audio.duration)
+    }
+
+    /// Lets the first recognition finish, whether or not it has begun waiting yet.
+    func release() {
+        released = true
+        held?.resume()
+        held = nil
+    }
+
+    var isHolding: Bool { held != nil }
+}
+
+/// A tidier whose first tidy does not finish until the test lets it, so the key can come up mid-tidy.
+private actor HeldCleaner: TranscriptCleaning {
+    private var calls = 0
+    private var held: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func clean(_ request: TransformationRequest) async throws(TransformationError) -> TransformationResult {
+        calls += 1
+        if calls == 1, !released { await withCheckedContinuation { held = $0 } }
+        return TransformationResult(text: request.transcription.text, producedBy: .foundationModels)
+    }
+
+    nonisolated func warm(for situation: Situation?) async {}
+
+    /// Lets the first tidy finish, whether or not it has begun waiting yet.
+    func release() {
+        released = true
+        held?.resume()
+        held = nil
+    }
+
+    var isHolding: Bool { held != nil }
+}
+
 /// A tidier that shouts, so its work on each piece can be seen, and remembers where it was warmed for.
 private final class ShoutingCleaner: TranscriptCleaning, Sendable {
     private let state = Mutex((warmed: [Destination?](), seen: [String]()))
@@ -70,7 +123,12 @@ private final class StageRendezvous: Sendable {
         var recognitionsInFlight = 0
         var recognitions = 0
         var besides = 0
+        /// Set once any wait runs out, so a serial pipeline pays the limit once rather than at every stage.
+        var gaveUp = false
     }
+
+    /// Long enough that only a pipeline that never overlaps the stages reaches it.
+    private static let limit = Duration.seconds(20)
 
     private let state = Mutex(State())
 
@@ -88,7 +146,7 @@ private final class StageRendezvous: Sendable {
             return state.besides
         }
         // Waits to be noticed rather than for a tidy to be in flight, which a prompt tidy is only briefly.
-        if waits { await until(within: .seconds(2)) { $0.besides > noticed } }
+        if waits { await until(within: Self.limit) { $0.besides > noticed } }
         let answer = await work()
         state.withLock { $0.recognitionsInFlight -= 1 }
         return answer
@@ -97,19 +155,22 @@ private final class StageRendezvous: Sendable {
     /// Holds a tidy open until a recognition is running beside it, which a serial pass can never provide.
     func tidy(waitsForARecognition waits: Bool) async {
         guard waits else { return }
-        if await until(within: .seconds(2), { $0.recognitionsInFlight > 0 }) {
+        if await until(within: Self.limit, { $0.recognitionsInFlight > 0 }) {
             state.withLock { $0.besides += 1 }
         }
     }
 
-    /// Polls until the condition holds, answering whether it ever did rather than how long it took.
+    /// Polls until the condition holds, answering whether it ever did; after one wait runs out, none waits again.
     @discardableResult
     private func until(within limit: Duration, _ holds: @Sendable (borrowing State) -> Bool) async -> Bool {
         let deadline = ContinuousClock.now + limit
         repeat {
-            if state.withLock({ holds($0) }) { return true }
+            let (held, gaveUp) = state.withLock { (holds($0), $0.gaveUp) }
+            if held { return true }
+            if gaveUp { return false }
             try? await Task.sleep(for: .milliseconds(2))
         } while ContinuousClock.now < deadline
+        state.withLock { $0.gaveUp = true }
         return false
     }
 }
@@ -204,6 +265,9 @@ private enum Take {
         [Float](repeating: 0, count: Int(seconds * Double(rate)))
     }
 
+    /// One phrase with no pause in it, so nothing is ever worked ahead.
+    static let onePiece = AudioSamples.canonical(tone(1.2))
+
     /// Three phrases with a clear pause after the first two.
     static let threePieces = AudioSamples.canonical(
         tone(1.2) + silence(0.5) + tone(1.2) + silence(0.5) + tone(0.4))
@@ -268,7 +332,8 @@ struct DictationPipelineEarlyWorkTests {
         await pipeline.finishRecording()
 
         let state = await pipeline.currentState
-        #expect(state.outcome?.text == "W1 X W2 X W3 X")
+        // Each seam ends a sentence; the final stop is the message stage's, which this cleaner leaves alone.
+        #expect(state.outcome?.text == "W1 X. W2 X. W3 X")
         #expect(state.outcome?.cleanedBy == .foundationModels)
         #expect(await speech.calls == 3)
         let counts = await speech.sampleCounts
@@ -385,7 +450,8 @@ struct DictationPipelineEarlyWorkTests {
         await pipeline.finishRecording()
 
         let state = await pipeline.currentState
-        #expect(state.outcome?.text == "W3 X W2 X W4 X", "the failed piece is redone in its own place")
+        #expect(
+            state.outcome?.text == "W3 X. W2 X. W4 X", "the failed piece is redone in its own place")
         #expect(await speech.calls == 4, "only the failed piece and the tail are left for the end")
     }
 
@@ -401,7 +467,7 @@ struct DictationPipelineEarlyWorkTests {
         await pipeline.retry(recording.id)
 
         let state = await pipeline.currentState
-        #expect(state.outcome?.text == "W1 X W2 X W3 X")
+        #expect(state.outcome?.text == "W1 X. W2 X. W3 X")
         #expect(state.outcome?.isFromRecording == true)
         #expect(await speech.calls == 3)
     }
@@ -415,7 +481,7 @@ struct DictationPipelineEarlyWorkTests {
         await pipeline.startRecording()
         await pipeline.finishRecording()
 
-        #expect(await pipeline.currentState.outcome?.text == "W1 X W3 X")
+        #expect(await pipeline.currentState.outcome?.text == "W1 X. W3 X")
     }
 
     @Test("a recording with nothing in any window is refused as silence")
@@ -440,7 +506,7 @@ struct DictationPipelineEarlyWorkTests {
         await pipeline.finishRecording()
 
         let outcome = await pipeline.currentState.outcome
-        #expect(outcome?.text == "W1 X W2 X W3 X")
+        #expect(outcome?.text == "W1 X. W2 X. W3 X")
         #expect(outcome?.changes.corrections.map(\.wordRange) == [0..<1, 2..<3, 4..<5])
         #expect(outcome?.changes.spokenWords == 6)
     }
@@ -455,7 +521,7 @@ struct DictationPipelineEarlyWorkTests {
         await pipeline.finishRecording()
 
         let outcome = await pipeline.currentState.outcome
-        #expect(outcome?.text == "W1 X w2 x W3 X")
+        #expect(outcome?.text == "W1 X. w2 x. W3 X")
         #expect(outcome?.cleanedBy == .rules)
     }
 
@@ -527,12 +593,77 @@ struct DictationPipelineEarlyWorkTests {
         await pipeline.retry(recording.id)
 
         #expect(
-            await pipeline.currentState.outcome?.text == "W1 X W2 X W3 X",
+            await pipeline.currentState.outcome?.text == "W1 X. W2 X. W3 X",
             "the pieces are joined in the order they were spoken")
         #expect(rendezvous.recognitions == 3)
         // Each stage waits for the other, so a late-scheduled tidy is waited for rather than missed.
         #expect(
             rendezvous.tidiesBesideARecognition == 2,
             "every tidy but the last runs beside the next recognition")
+    }
+
+    /// Releases the key while `holding` is true of the first piece, then lets that piece finish once the release is waiting on it.
+    private func releaseMidPiece(
+        _ pipeline: DictationPipeline, holding: @Sendable () async -> Bool, letGo: @Sendable () async -> Void
+    ) async {
+        await pipeline.startRecording()
+        for _ in 0..<2000 where await !holding() {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        #expect(await holding(), "the first piece never reached the stage being held")
+        let finishing = Task { await pipeline.finishRecording() }
+        for _ in 0..<2000 where await pipeline.currentState != .transcribing {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        await letGo()
+        await finishing.value
+    }
+
+    /// The drain begins when the key comes up, so the user waits through it and Diagnostics must say so.
+    @Test("charges the wait to the drain when the key comes up while the piece is being tidied")
+    func measuresTheDrain() async {
+        let capture = FakeAudioCaptureEngine(stopOutcome: .success(Take.threePieces))
+        await capture.setCaptured(Take.threePieces)
+        let cleaner = HeldCleaner()
+        let metrics = RecordingMetricsRecorder()
+        let pipeline = makePipeline(capture: capture, cleaner: cleaner, metrics: metrics)
+
+        await releaseMidPiece(
+            pipeline, holding: { await cleaner.isHolding }, letGo: { await cleaner.release() })
+
+        #expect(await metrics.measurements.contains { $0.stage == .drain })
+    }
+
+    /// Issue 344: recognition is usually the longer half of the in-flight piece, and was the half the drain missed.
+    @Test("charges the wait to the drain when the key comes up while the piece is still being recognised")
+    func measuresTheDrainDuringRecognition() async {
+        let capture = FakeAudioCaptureEngine(stopOutcome: .success(Take.threePieces))
+        await capture.setCaptured(Take.threePieces)
+        let speech = HeldSpeechEngine()
+        let metrics = RecordingMetricsRecorder()
+        let pipeline = makePipeline(capture: capture, speech: speech, metrics: metrics)
+
+        await releaseMidPiece(
+            pipeline, holding: { await speech.isHolding }, letGo: { await speech.release() })
+
+        #expect(await metrics.measurements.contains { $0.stage == .drain })
+    }
+
+    /// A dictation with no piece in flight waits for nothing, and a row of zero would only mislead.
+    @Test("charges nothing when there was no piece in flight")
+    func measuresNoDrainWithoutEarlyWork() async {
+        let capture = FakeAudioCaptureEngine(stopOutcome: .success(Take.onePiece))
+        await capture.setCaptured(Take.onePiece)
+        let metrics = RecordingMetricsRecorder()
+        // No early poll ever fires, so nothing is ever in flight to wait for.
+        let pipeline = DictationPipeline(
+            capture: capture, speech: NumberingSpeechEngine(), cleaner: ShoutingCleaner(),
+            context: FakeContextEngine(context: .fixture()), inserter: CollectingInserter(),
+            metrics: metrics, windowing: quick, earlyPoll: .seconds(60))
+
+        await pipeline.startRecording()
+        await pipeline.finishRecording()
+
+        #expect(await metrics.measurements.contains { $0.stage == .drain } == false)
     }
 }

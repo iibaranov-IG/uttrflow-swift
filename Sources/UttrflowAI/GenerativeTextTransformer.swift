@@ -59,22 +59,28 @@ public struct GenerativeTextTransformer: TextTransformationEngine {
 
         // Models echo the shape of the worked examples, so the answer is unwrapped before it is judged.
         let unwrapped = ResponseUnwrapper.unwrap(rewritten, spoken: spoken)
-        let finishing = CleaningPipeline.afterModel(
-            for: formatter, situation: request.situation, heard: request.transcription.text)
+        let finishing =
+            request.scope == .piece
+            ? CleaningPipeline.afterModelPiece(situation: request.situation)
+            : CleaningPipeline.afterModel(
+                for: formatter, situation: request.situation, heard: request.transcription.text)
         let polished = finishing.run(Draft(keepingLineBreaks: TextTidy.collapseSpacing(unwrapped)))
         let finished = polished.text
 
         // A refusal is not a failure: the router moves on, and the floor beneath it cannot invent anything.
         if case .rejected(let reason) = meaningGuard.verdict(
             draft: draft, rewritten: finished, offering: readings, echoed: Self.echo(in: polished),
-            layout: formatter.layout)
+            layout: formatter.layout, grants: pipeline.grants)
         {
             throw .outputRejected(reason: reason)
         }
 
+        // Only a taught reading has an entry to count; the screen's and the vocabulary's have none.
+        let taken = meaningGuard.readingsTaken(draft: draft, rewritten: finished, offering: readings)
         return TransformationResult(
             text: finished, producedBy: kind,
-            cleaning: CleaningRecord(draft: draft, ran: pipeline.ids))
+            cleaning: CleaningRecord(draft: draft, ran: pipeline.ids),
+            entriesTaken: taken.compactMap(\.entryID))
     }
 
     /// The caret's echo the finishing pipeline took back, which the model did answer with and the guard must see.

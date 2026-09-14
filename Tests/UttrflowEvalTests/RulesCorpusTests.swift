@@ -17,7 +17,14 @@ struct RulesCorpusTests {
         "coordinated-list-kept", "repeated-frame-kept", "emphatic-double-kept",
         "coordination-kept-not-restatement", "repeated-frame-for-kept",
         "doubled-place-name-kept", "coordinated-apology-kept", "spoken-comma",
-        "comma-as-a-word", "quotation-opening-the-text", "new-paragraph", "time-of-day",
+        "comma-as-a-word", "quotation-opening-the-text",
+        "spoken-comma-after-a-greeting", "spoken-comma-after-an-opener", "spoken-comma-after-yes",
+        "spoken-commas-in-a-bare-list", "spoken-comma-before-and", "spoken-colon-before-a-clause",
+        "spoken-colon-before-an-item", "spoken-colon-at-the-end", "spoken-dash-before-a-clause",
+        "colon-cancer-as-words", "colon-trouble-as-words", "colon-surgery-as-words", "colon-health-as-words",
+        "comma-separated-as-words", "comma-usage-as-words", "comma-splices-as-words",
+        "comma-placement-as-words", "dash-training-as-words", "dash-cam-as-words", "dash-drills-as-words",
+        "period-furniture-as-words", "new-paragraph", "time-of-day",
         "percentage", "money",
         "period-as-a-word", "spoken-period",
         "period-after-new-line", "dates", "ordinal-not-date",
@@ -26,6 +33,7 @@ struct RulesCorpusTests {
         "dictated-question", "dictated-instruction", "injection", "asks-for-help", "sounds-like-a-prompt",
         "message-two-sentences-no-stop", "mid-sentence-continues-lower-case", "spreadsheet-cell-no-stop",
         "document-sentence-with-stop", "document-list-only-when-spoken", "document-sentence-not-a-list",
+        "document-numbered-items-after-a-sentence", "document-number-one-after-a-sentence-not-an-item",
         "document-sentence-ending-in-a-percentage", "document-sentence-ending-in-a-close-quote",
         "document-bullet-caret-capitalises", "document-numbered-caret-capitalises",
         "spreadsheet-number-in-cell", "spreadsheet-percentage-in-cell", "sql-editor-prose-stays-prose",
@@ -34,6 +42,14 @@ struct RulesCorpusTests {
         "code-editor-line-break-preserved", "code-editor-numeral-no-stop",
         "message-short-no-stop", "email-greeting-kept", "email-continues-mid-sentence",
         "email-two-paragraphs",
+        "numbered-items-for-a-trip", "numbered-items-three-of-them", "numbered-items-a-plan",
+        "numbered-items-before-lunch", "numbered-items-as-digits", "numbered-items-an-agenda",
+        "numbered-items-priorities", "numbered-items-steps", "numbered-items-continuing",
+        "numbered-items-reminders", "number-ring-not-an-item", "number-call-not-an-item",
+        "number-check-not-an-item", "number-bus-not-an-item", "number-row-not-an-item",
+        "number-invoice-not-an-item", "number-gate-not-an-item", "number-platform-not-an-item",
+        "number-flight-not-an-item", "number-room-not-an-item", "number-press-not-an-item",
+        "number-jersey-not-an-item",
     ]
 
     /// Destination cases only the model can pass: a spelling off the screen, or a question mark from a sentence's shape.
@@ -64,7 +80,7 @@ struct RulesCorpusTests {
         // Grammar cases name a destination too, but repairs are the model's alone; the floor is below.
         let named = Set(
             EvaluationCorpus.all.filter { $0.destination != .plain && $0.category != .grammar }.map(\.id))
-        #expect(named.count == 26)
+        #expect(named.count == 50)
         #expect(named.subtracting(Self.modelOnly).isSubset(of: Self.rulesMustPass))
         #expect(Self.modelOnly.isSubset(of: named))
         #expect(Self.modelOnly.isDisjoint(with: Self.rulesMustPass))
@@ -119,6 +135,18 @@ struct RulesCorpusTests {
     func halvedRunFails(id: String, halved: String) throws {
         let testCase = try #require(EvaluationCorpus.all.first { $0.id == id })
         #expect(!Scorer.score(halved, against: testCase).passed)
+    }
+
+    @Test("fails when the prose repetition is rewritten as the selected identifier")
+    func identifierThenProseKeepsProseMention() throws {
+        let testCase = try #require(
+            EvaluationCorpus.all.first { $0.id == "editor-identifier-then-prose" })
+        let score = Scorer.score(
+            "We call setUserPrefs at launch, so the settings page never has to setUserPrefs again.",
+            against: testCase
+        )
+        #expect(!score.keptEverythingRequired)
+        #expect(score.lost == ["set user prefs"])
     }
 
     @Test("names only cases that exist")

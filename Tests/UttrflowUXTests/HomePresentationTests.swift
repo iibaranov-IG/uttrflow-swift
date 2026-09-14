@@ -1,6 +1,7 @@
 // Tests for the home page: greeting, subtitle, recent rows, demonstration, status, and the corner.
 import Foundation
 import UttrflowAccount
+import UttrflowClipboard
 import UttrflowCore
 import UttrflowHistory
 import UttrflowSettings
@@ -96,15 +97,14 @@ struct HomeSubtitleTests {
         #expect(page.subtitle == "Nothing yet today. Your words from earlier are still here.")
     }
 
-    @Test("a brand new install is told what to do")
+    /// The hero already says how to start, so a card under it saying so again is only repetition.
+    @Test("a brand new install is told what to do once, in the hero")
     func nothingEver() {
         let page = HistoryFixture.home()
         #expect(page.subtitle == "Nothing dictated yet. Hold the shortcut anywhere and talk.")
-        #expect(page.nextStep?.title == "Try it now")
-        #expect(page.nextStep?.message.contains("⌥Space") == true)
+        #expect(page.nextStep == nil)
     }
 
-    /// A page that keeps suggesting first steps to somebody three months in is a page they stop reading.
     @Test("somebody who has dictated is not told how to start")
     func noStepOnceStarted() {
         #expect(HistoryFixture.home(entries: [HistoryFixture.entry("said something")]).nextStep == nil)
@@ -123,6 +123,13 @@ struct HomeBlockedTests {
         #expect(page.recent.isEmpty)
         #expect(page.nextStep != nil)
         #expect(page.subtitle == "Uttrflow cannot listen yet.")
+    }
+
+    @Test("a missing permission still shows on a brand new install")
+    func blockedWithNoHistory() {
+        let page = HistoryFixture.home(permissions: [.microphone: .denied, .accessibility: .granted])
+        #expect(page.nextStep != nil)
+        #expect(page.nextStep?.title != "Try it now")
     }
 }
 
@@ -183,6 +190,15 @@ struct HomeDemonstrationTests {
                 "Flat 402, Example Residences, Bengaluru",
             ])
         #expect(shown.rows.contains { $0.isMasked })
+    }
+
+    /// Only a password manager's marker hides a password, so the promise names password managers.
+    @Test("promises to hide only what the detector can recognise")
+    func promisesWhatIsDetected() throws {
+        let shown = try #require(HistoryFixture.home().demonstration)
+        #expect(shown.explanation.contains("passwords from a password manager"))
+        #expect(!shown.explanation.contains("Passwords and card numbers"))
+        #expect(ClipKindDetector.kind(of: "4111 1111 1111 1111") == .secret)
     }
 
     /// The only part anybody cares about is the words arriving in what they were already writing.

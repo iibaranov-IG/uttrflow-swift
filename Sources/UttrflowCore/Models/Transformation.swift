@@ -1,4 +1,5 @@
 // The request a transformer takes, the result it gives, and how it says whether it can take one.
+public import struct Foundation.UUID
 
 /// Everything a transformer needs to clean up one utterance.
 public struct TransformationRequest: Sendable, Equatable {
@@ -10,24 +11,36 @@ public struct TransformationRequest: Sendable, Equatable {
     public let profile: UserProfile
     /// Where the words are going, resolved from the context unless a caller already knows.
     public let situation: Situation
+    /// Whether the transcript is the whole message or one piece of it, which decides the passes that run.
+    public let scope: CleaningScope
 
-    /// A request; context and profile default to knowing nothing.
+    /// A request; context and profile default to knowing nothing, and the transcript to being the whole message.
     public init(
         transcription: Transcription,
         context: AppContext = .unknown,
         profile: UserProfile = .default,
-        situation: Situation? = nil
+        situation: Situation? = nil,
+        scope: CleaningScope = .message
     ) {
         self.transcription = transcription
         self.context = context
         self.profile = profile
         self.situation = situation ?? SituationResolver.resolve(from: context)
+        self.scope = scope
     }
 
     /// The language to route on: what the engine heard, else the user's first preferred language.
     public var effectiveLanguage: LanguageCode? {
         transcription.detectedLanguage?.code ?? profile.preferredLanguages.first
     }
+}
+
+/// How much of the message a transcript is. See `Docs/cleanup-design.md` §7.
+public enum CleaningScope: Sendable, Equatable {
+    /// The whole message: every pass runs, the first word and the final stop included.
+    case message
+    /// One piece of a longer message: the first word and the final stop wait for the joined whole.
+    case piece
 }
 
 /// Cleaned-up text, tagged with what produced it.
@@ -38,17 +51,24 @@ public struct TransformationResult: Sendable, Equatable {
     public let producedBy: TransformerKind
     /// What the deterministic steps did on the way, when the transformer keeps a record.
     public let cleaning: CleaningRecord?
+    /// The dictionary entries whose spelling the model wrote for a doubtful run, counted used like a correction's.
+    public let entriesTaken: [UUID]
 
     /// A result tagged with its producer and, where one was kept, the record of the steps.
-    public init(text: String, producedBy: TransformerKind, cleaning: CleaningRecord? = nil) {
+    public init(
+        text: String, producedBy: TransformerKind, cleaning: CleaningRecord? = nil,
+        entriesTaken: [UUID] = []
+    ) {
         self.text = text
         self.producedBy = producedBy
         self.cleaning = cleaning
+        self.entriesTaken = entriesTaken
     }
 
     /// The same result, carrying a record that says what was refused on the way to it.
     public func recording(_ cleaning: CleaningRecord?) -> TransformationResult {
-        TransformationResult(text: text, producedBy: producedBy, cleaning: cleaning)
+        TransformationResult(
+            text: text, producedBy: producedBy, cleaning: cleaning, entriesTaken: entriesTaken)
     }
 }
 

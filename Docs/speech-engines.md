@@ -62,6 +62,43 @@ relies on. `Docs/bakeoff.md` compares the engines; `Docs/offline.md` states the 
 - Not yet measured against the corpus. The same padding reaches a short final piece of a long
   dictation, which is decoded alone rather than merged into the piece before it.
 
+## Which language the recogniser may answer in
+
+- Detection is held to `LanguageCode.transcribed`, English and Hindi. WhisperKit's own detector
+  chooses among every language the model knows, and Urdu sits close enough to Hindi that spoken
+  Hindi was sometimes written in Perso-Arabic script, or decoded under the English token and so
+  came back translated. Neither can be undone after the recogniser, so the language token is
+  constrained before the text is decoded. `LanguageHeldDecoder` wraps WhisperKit's text decoder
+  and hands its detector `AllowedLanguageSampler`, which takes the likeliest allowed language.
+- The task token is always `transcribe`; `WhisperKitContractTests` and `LanguageHeldDecoderTests`
+  both read it back off the options.
+- The constraint is the product's languages, not the profile's. `UserProfile.preferredLanguages`
+  starts as English alone for everyone, so holding detection to it would force every Hindi
+  speaker who never opened Settings into English. Every language Settings offers is in the
+  transcribed set, so no choice the user can make is narrowed by it.
+- WhisperKit re-runs detection for every fallback temperature and samples it the same way it
+  samples text, top-k at that temperature. The allowed sampler ignores the temperature, so one
+  window cannot change its language between retries.
+
+## The compression ratio a Hindi decode is judged by
+
+- WhisperKit retries a window warmer when its token ids compress better than 2.4 under zlib, the
+  sign of a decode repeating itself. Devanagari is spelled in many short tokens, so a clean
+  Hindi decode compresses far better than English does. Measured on the synthetic corpus with
+  the shipping turbo model, every greedy decode confident to an average log-probability above
+  -0.1: English 1.36 to 1.69, Hindi 1.75 to 2.60. A third of the Hindi windows crossed 2.4.
+- A crossed window was re-decoded at temperature 0.2 and upwards, which samples: the same audio
+  gave different words on every run, an Arabic letter inside a Devanagari word, and a language
+  re-detected by chance. A sampled Hindi decode that really had looped measured 3.91.
+- `LanguageHeldDecoder.judged` re-reads a compression verdict for a window decoded as Hindi
+  against 3.0, and then applies the log-probability test WhisperKit would have applied next.
+  English keeps Whisper's 2.4, and every other verdict is left as WhisperKit gave it.
+- The 18 corpus passages, eight runs each, give 96 Hindi and Hinglish transcripts. Without
+  either change, 4 were wholly in Perso-Arabic script, 6 had an Arabic letter inside a
+  Devanagari word, 1 was translated into English, and overall WER moved between runs from
+  12.3% to 18.4%. With both, none of those, every run gives identical text, and overall WER is
+  11.8%. English transcripts are unchanged byte for byte.
+
 ## Per-word confidence
 
 - Correction's first condition is that the recogniser was unsure. Without a per-word figure the
@@ -130,3 +167,54 @@ relies on. `Docs/bakeoff.md` compares the engines; `Docs/offline.md` states the 
   WhisperKit release or model variant that finds another way to return nothing must cost the
   user a slower dictation, never a silent one. Silence transcribes to nothing too, so this can
   decode twice for no gain, which is the right price.
+
+## One call into the recogniser at a time
+
+A loaded WhisperKit is one set of models with shared decoder state: the logits filters a
+prompted decode installs live on the kit, not on the call. Two decodes on one kit at once
+therefore read each other's rules, and on a slow Mac they also split the same CPU and memory.
+
+An actor does not prevent that. Every `await` inside an actor method lets the next caller
+in, and a decode is nothing but awaits, so `WhisperKitBackend` being an actor serialises
+nothing across a transcription. Nor does the pipeline: a stage that times out is cancelled
+and not awaited (see `Docs/stuck-recording.md`), and cancelling a dictation abandons its
+decode without cancelling it at all, so a dictation started straight afterwards reaches the
+recogniser while the old decode is still running.
+
+`BackedSpeechEngine` therefore holds a `RecogniserTurn` across every load and decode. Calls
+are admitted one at a time in the order they arrived; a later call waits for the earlier one
+to leave the recogniser, and a waiter that is cancelled — the pipeline's stage timeout does
+exactly that — leaves the queue and never decodes. The wait is bounded by the same stage
+limit as the decode, so a dictation stuck behind a wedged decode fails and names a retry
+rather than showing "transcribing" for ever.
+
+Measured with the default model on synthetic speech: a cancelled decode stops within about
+ten milliseconds, since WhisperKit checks for cancellation before every decoder step, so
+after a timeout the wait is short. After a cancelled dictation it is the rest of that
+decode. Four overlapping decodes on one kit, two with a prompt and two without, returned
+the unprompted text for both prompted decodes in one round of three: the filters of one
+call had been replaced by another's.
+
+## Word timings behind a prompt
+
+- WhisperKit's `SegmentSeeker.addWordTimestamps` reads the decoder's alignment weights from row
+  zero, taking it as the start-of-transcript token. Behind a conditioning prompt that row is the
+  start-of-previous token, and the transcript's rows begin at `prompt.count + 1`, so every word is
+  aligned against the prompt instead (WhisperKit 1.1.0, `Core/Text/SegmentSeeker.swift`).
+- The misaligned timings are not only wrong, they lose words. `TranscribeTask` drops a segment
+  whose word timings collapse to zero length, and advances `seek` to the last segment's end, which
+  a bad alignment can place past audio never decoded. Sentences vanish from the start, the middle
+  or the end of the dictation, and the same audio with the same prompt loses the same ones.
+- Measured on synthetic speech from `say`, three voices, eight clips from 5 to 55 seconds, five
+  runs each with no prompt and with 5, 20 and 100 dictionary words: 45 of the 120 prompted
+  decodes lost at least one sentence, 215 sentences in all, and none of the unprompted ones did.
+  With the rows lined up, none of the 120 lost a sentence.
+- `PromptAlignedSegmentSeeker` hands WhisperKit's own seeker the weights from the transcript's
+  first row onward; `DecoderPrefill.transcriptStart` counts the offset from the same trimmed prompt
+  the timestamp rules are measured from, and an unprompted decode keeps WhisperKit's seeker. The
+  seeker lives on the kit like the filters, so the turn above is what keeps one call's offset from
+  reaching another's decode.
+- Still seen after the fix: with 100 words, one 53-second clip's first window came back as a
+  single segment with no inner timestamps, so the window ended at its fixed 30 seconds and the
+  four words spoken across that boundary were lost. That is the decoder's segmentation under a
+  long prompt, not the alignment.

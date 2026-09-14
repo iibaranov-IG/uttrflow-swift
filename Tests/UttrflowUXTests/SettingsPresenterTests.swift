@@ -158,6 +158,20 @@ struct SettingsGeneralPaneTests {
                 == .shortcut(action: .dictate, keys: ["⌘", "K"]))
     }
 
+    /// Issue 353: the Dictate row showed one cap, ⌥, for a shortcut of ⌃⌥⌘ held together.
+    @Test("shows every modifier of a shortcut made only of modifiers")
+    func showsAModifierChord() {
+        var settings = Settings.default
+        settings.hotkey = HotkeyBinding(keyCode: 58, modifiers: [.option, .command, .control])
+        settings.clipboardHotkey = .shiftCommandV
+        #expect(
+            general(settings).row("shortcut.dictate")?.control
+                == .shortcut(action: .dictate, keys: ["⌃", "⌥", "⌘"]))
+        #expect(
+            general(settings).row("shortcut.clipboard")?.control
+                == .shortcut(action: .clipboard, keys: ["⇧", "⌘", "V"]))
+    }
+
     @Test("offers both ways of activating, with the stored one selected")
     func offersBothActivations() {
         var settings = Settings.default
@@ -281,6 +295,12 @@ struct SettingsLanguagesPaneTests {
         for language in SettingsLanguage.offered {
             #expect(language.id == language.code.value)
         }
+    }
+
+    /// The recogniser detects only transcribed languages, so an offered one outside them could never be heard.
+    @Test("offers only languages the recogniser is allowed to detect")
+    func offersOnlyTranscribedLanguages() {
+        #expect(SettingsLanguage.offered.map(\.code) == LanguageCode.transcribed)
     }
 
     @Test("shows the tidying level read out of the stored preference")
@@ -649,5 +669,33 @@ struct UnarmedShortcutTests {
     func armedIsUnchanged() throws {
         let shown = try #require(row(.everything))
         #expect(shown.explanation != SettingsPresenter.unarmed)
+    }
+}
+
+@Suite("A shortcut returned to its default")
+struct ReturnedShortcutTests {
+    private func row(_ id: String, in settings: Settings) -> SettingsRow? {
+        SettingsPresenter.pane(for: .general, settings: settings, capabilities: .everything)
+            .groups.flatMap(\.rows).first { $0.id == id }
+    }
+
+    /// Issue 342: a held ⌘ that quietly became ⌥Space would look like the app forgot the user's choice.
+    @Test("says why, on the row whose shortcut was put back")
+    func saysWhy() throws {
+        var settings = Settings.default
+        settings.shortcutsReturnedToDefault = [.dictate]
+
+        let shown = try #require(row("shortcut.dictate", in: settings))
+
+        #expect(shown.explanation == SettingsPresenter.returnedToDefault)
+        let untouched = try #require(row("shortcut.clipboard", in: settings))
+        #expect(untouched.explanation != SettingsPresenter.returnedToDefault)
+    }
+
+    @Test("says nothing of it once the note is gone")
+    func saysNothingWithoutTheNote() throws {
+        let shown = try #require(row("shortcut.dictate", in: .default))
+
+        #expect(shown.explanation != SettingsPresenter.returnedToDefault)
     }
 }

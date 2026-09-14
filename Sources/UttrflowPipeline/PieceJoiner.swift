@@ -42,7 +42,25 @@ enum PieceJoiner {
             corrected: CorrectedTranscript(
                 text: correctedText.joined(separator: " "), corrections: corrections),
             cleaned: TransformationResult(
-                text: laidOut(pieces.map(\.cleaned.text), under: formatter), producedBy: producedBy))
+                text: laidOut(seamed(pieces.map(\.cleaned.text), under: formatter), under: formatter),
+                producedBy: producedBy, entriesTaken: pieces.flatMap(\.cleaned.entriesTaken)))
+    }
+
+    /// Every piece but the last ended as a sentence the way the place ends one; the message's own stop is the cleaner's.
+    static func seamed(_ pieces: [String], under formatter: DestinationFormatter) -> [String] {
+        pieces.enumerated().map { index, text in
+            index == pieces.count - 1 ? text : endedAtSeam(text, under: formatter)
+        }
+    }
+
+    /// One piece ended at a seam: a pause the windowing cut at, which every stopping place reads as a sentence end. See `Docs/cleanup-design.md` §7.
+    private static func endedAtSeam(_ text: String, under formatter: DestinationFormatter) -> String {
+        if formatter.terminalStop == .never { return WordShape.withoutTrailingStop(text) }
+        let piece = Draft(keepingLineBreaks: text)
+        guard let last = text.last, !last.isNewline, !piece.endsInListItem,
+            !(formatter.layout.contains(.preserveNewlines) && text.contains(where: \.isNewline))
+        else { return text }
+        return WordShape.finished(text)
     }
 
     /// The cleaned pieces as one text: a spoken list, a paragraph at a topic, a restatement across the seam, else a space.

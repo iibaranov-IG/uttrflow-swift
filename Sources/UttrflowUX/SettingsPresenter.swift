@@ -69,6 +69,12 @@ public enum SettingsPresenter {
     /// Said before anything else: a key that is not claimed does nothing, whatever the row shows.
     static let unarmed = "Uttrflow could not claim this shortcut, so it does nothing. Try another."
 
+    /// Said once a modifier held alone has been put back, so the change is not a mystery.
+    static let returnedToDefault = """
+        This was a key held on its own, which also fired on every shortcut using that key, \
+        so it is back to the default. Choose another any time.
+        """
+
     /// One shortcut's row, drawn the same way whichever shortcut it is.
 
     private static func shortcutRow(
@@ -84,6 +90,15 @@ public enum SettingsPresenter {
                 control: .shortcut(
                     action: descriptor.action,
                     keys: binding.map(SettingsShortcut.keycaps) ?? []))
+        }
+        if settings.shortcutsReturnedToDefault.contains(descriptor.action) {
+            return SettingsRow(
+                id: "shortcut.\(descriptor.action.rawValue)",
+                label: descriptor.label,
+                explanation: returnedToDefault,
+                control: .shortcut(
+                    action: descriptor.action,
+                    keys: binding.map(SettingsShortcut.keycaps(for:)) ?? []))
         }
         return SettingsRow(
             id: "shortcut.\(descriptor.action.rawValue)",
@@ -362,8 +377,8 @@ public enum SettingsPresenter {
             callout: SettingsCallout(
                 symbolName: "lock",
                 message:
-                    "Completions come from what you have typed on this Mac. Nothing is uploaded, "
-                    + "and a password field is never read."))
+                    "Completions come from what you have typed on this Mac, kept in Uttrflow's own "
+                    + "folder. Nothing is uploaded, and a password field is never read."))
     }
 
     /// Says what the model is doing, since a switch that is on and silent is indistinguishable from broken.
@@ -387,6 +402,13 @@ public enum SettingsPresenter {
                 symbolName: "clock",
                 title: "Getting ready",
                 message: "The model is being read into memory. This happens once per launch.")
+        case .releasedForMemory:
+            return SettingsBanner(
+                symbolName: "memorychip",
+                title: "Paused to free memory",
+                message:
+                    "This Mac is short of memory, so the model that finishes your lines has been "
+                    + "set aside. Suggestions come back on their own once memory frees up.")
         case .failed:
             return SettingsBanner(
                 symbolName: "exclamationmark.triangle",

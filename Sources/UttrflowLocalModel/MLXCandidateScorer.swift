@@ -23,38 +23,120 @@ public struct JudgedToken: Sendable, Equatable {
 }
 
 /// Judges and invents suggestions with one loaded model: scores a candidate, or generates one from nothing.
-public actor MLXCandidateScorer: CandidateScoring, PassShowing {
+public actor MLXCandidateScorer: CandidateScoring, PassShowing, ReleasableModel {
     private let model: LocalModel
     private let maximumTokens: Int
     private var container: ModelContainer?
+    private let bufferCache: BufferCacheControl
 
     /// Where a pass reports its timing and its failures: numbers and error text only, never the prompt.
     private static let log = Logger(subsystem: "com.uttrflow.Uttrflow", category: "predict")
 
     public init(model: LocalModel, maximumTokens: Int = 128) {
-        self.model = model
-        self.maximumTokens = maximumTokens
+        self.init(model: model, maximumTokens: maximumTokens, bufferCache: .mlx)
     }
 
-    /// Downloads and loads the weights, which a caller pays for deliberately rather than in a keystroke.
+    init(
+        model: LocalModel, maximumTokens: Int, bufferCache: BufferCacheControl,
+        cache: URL = HubCache.default.cacheDirectory, loading: WeightLoading<ModelContainer> = .mlx
+    ) {
+        self.model = model
+        self.maximumTokens = maximumTokens
+        self.bufferCache = bufferCache
+        self.cache = cache
+        self.weights = ReloadableWeights(loading: loading)
+    }
+
+    /// The model's modules, built on the first load and only emptied and refilled after it. See `Docs/performance.md`.
+    private let weights: ReloadableWeights<ModelContainer>
+
+    /// How many passes are using the model now, which a release waits out before it empties the weights.
+    private var passesRunning = 0
+    private var waitingForPasses: [CheckedContinuation<Void, Never>] = []
+
+    /// The Hugging Face cache a whole model is loaded from without asking the hub.
+    private let cache: URL
+
+    /// Loads the weights from disk when they are whole there, downloading them only when they are not.
     public func prepare(onProgress: @escaping @Sendable (Double) -> Void = { _ in }) async throws {
         guard container == nil else { return }
-        container = try await loadModelContainer(
-            from: #hubDownloader(),
-            using: #huggingFaceTokenizerLoader(),
-            configuration: ModelConfiguration(id: model.identifier),
-            progressHandler: { onProgress($0.fractionCompleted) }
-        )
+        // The instruction warm-up is a pass like any other, so it is held to the cap and leaves nothing cached.
+        bufferCache.hold()
+        defer { bufferCache.clear() }
+        let directory = try await model.weightsDirectory(
+            cache: cache, downloader: { #hubDownloader() }, onProgress: onProgress)
+        guard let loaded = try await weights.load(from: directory) else { return }
+        container = loaded
+        beginPass()
+        defer { endPass() }
         warm = await warmInstructions()
+        prompt = await promptTokens(
+            addedTokens: AddedToken.read(fromTokenizerFile: directory.appending(path: "tokenizer.json")))
         vocabulary = await container?.perform { context in
             TokenHealing.Vocabulary(
                 tokenizer: context.tokenizer, endOfTurn: context.configuration.extraEOSTokens,
                 endingIds: context.configuration.eosTokenIds)
         }
+        // A release that landed while the instructions were read leaves nothing of them behind.
+        if container == nil { forgetReadings() }
+    }
+
+    /// Empties the weights once every pass using them has ended, and hands the freed GPU buffers back to the system.
+    public func release() async {
+        container = nil
+        forgetReadings()
+        await passesEnded()
+        await weights.unload()
+        bufferCache.clear()
+    }
+
+    /// Builds the model's modules and reads its weights, which is the one path that quantises.
+    static func buildContainer(from directory: URL) async throws -> ModelContainer {
+        try await loadModelContainer(from: directory, using: #huggingFaceTokenizerLoader())
+    }
+
+    /// Drops everything read from the weights.
+    private func forgetReadings() {
+        warm = nil
+        prompt = nil
+        vocabulary = nil
+    }
+
+    /// Marks a pass as using the model.
+    private func beginPass() { passesRunning += 1 }
+
+    /// Marks a pass as done, resuming a release that was waiting for the last one.
+    private func endPass() {
+        passesRunning -= 1
+        guard passesRunning == 0 else { return }
+        let waiting = waitingForPasses
+        waitingForPasses = []
+        waiting.forEach { $0.resume() }
+    }
+
+    /// Returns once no pass is using the model.
+    private func passesEnded() async {
+        guard passesRunning > 0 else { return }
+        await withCheckedContinuation { waitingForPasses.append($0) }
     }
 
     /// The instructions as the model has already read them, so a pass pays only for the moment's own tokens.
     private var warm: WarmInstructions?
+
+    /// The template's frame and the message's lines already tokenised, so a pass tokenises only the lines that changed.
+    private var prompt: PromptTokens?
+
+    /// Reads the template's frame once, or nothing when the tokenizer cannot promise lines tokenise alone as they do together.
+    private func promptTokens(addedTokens: [AddedToken]?) async -> PromptTokens? {
+        guard let container, let addedTokens else { return nil }
+        return await container.perform { context in
+            await PromptTokens(
+                addedTokens: addedTokens,
+                render: { try await Self.promptTokens(for: $0, context: context) },
+                encode: { context.tokenizer.encode(text: $0, addSpecialTokens: false) },
+                tokenText: { context.tokenizer.convertIdToToken($0) })
+        }
+    }
 
     /// Every token's text, read once, so a pass can hold the model to the word being typed.
     private var vocabulary: TokenHealing.Vocabulary?
@@ -88,6 +170,7 @@ public actor MLXCandidateScorer: CandidateScoring, PassShowing {
     private static func promptTokens(for message: String, context: ModelContext) async throws -> [Int] {
         let input = try await context.processor.prepare(
             input: UserInput(chat: [.system(instructions), .user(message)]))
+        precondition(input.text.tokens.ndim == 1, "the processor hands over one flat run of tokens")
         return input.text.tokens.asArray(Int32.self).map(Int.init)
     }
 
@@ -211,9 +294,14 @@ public actor MLXCandidateScorer: CandidateScoring, PassShowing {
     private func run(
         typed: String, in situation: GenerationSituation, asking ask: Ask, tokenShare: Int
     ) async throws -> Run? {
+        // Every pass is held to the cache's cap and leaves nothing in it, however it ends. See `Docs/performance.md`.
+        bufferCache.hold()
+        defer { bufferCache.clear() }
         guard let container, !Task.isCancelled,
             typed.trimmingCharacters(in: .whitespaces).count >= Self.minimumTypedLength
         else { return nil }
+        beginPass()
+        defer { endPass() }
         // The register decides how much of a pass this line is worth: a command a little, a paragraph more.
         let register = Register.infer(from: situation, typed: typed)
         // A host and a search phrase are not things a model can know: each exists in this person's history or nowhere, so a guess at one is refused rather than drawn. See `Docs/predict-precision.md`.
@@ -223,20 +311,27 @@ public actor MLXCandidateScorer: CandidateScoring, PassShowing {
         // With the machine's values to choose among, the whole line before the word opens the turn and the word is one of them.
         let choice = opening.flatMap { Self.choice(of: situation.choices, at: $0) }
         let warm = self.warm
+        let prompt = self.prompt
         let vocabulary = self.vocabulary
         let perLine = register.maxTokens
         let cap = maximumTokens
         let stream: AsyncStream<Generation>
+        let generation: Task<Void, Never>
         do {
-            stream = try await container.perform { loaded in
+            (stream, generation) = try await container.perform { loaded in
                 try Task.checkCancellation()
                 var context = loaded
                 // The producer ends at the newline itself when one line is wanted, so no decode step is spent past it.
                 if let stop = ask.stopStrings { context.configuration.stopStrings = stop }
-                let input = try await context.processor.prepare(
-                    input: UserInput(chat: [.system(Self.instructions), .user(message)]))
-                precondition(input.text.tokens.ndim == 1, "the processor hands over one flat run of tokens")
-                var all = input.text.tokens.asArray(Int32.self).map(Int.init)
+                // The frame and the unchanged lines come from the cache; a message it cannot vouch for is tokenised whole.
+                var all: [Int]
+                if let known = prompt?.tokens(
+                    for: message, encode: { context.tokenizer.encode(text: $0, addSpecialTokens: false) })
+                {
+                    all = known
+                } else {
+                    all = try await Self.promptTokens(for: message, context: context)
+                }
                 // The line up to its last word opens the model's turn when one line is wanted, so decoding can only continue it.
                 let written = choice?.written ?? opening?.written ?? ""
                 if !written.isEmpty {
@@ -256,26 +351,28 @@ public actor MLXCandidateScorer: CandidateScoring, PassShowing {
                     maxTokens: Self.tokenBudget(perLine: perLine, lines: tokenShare, echo: echo, cap: cap),
                     temperature: 0)
                 try Task.checkCancellation()
-                guard let opening, let vocabulary else {
-                    return try MLXLMCommon.generate(
-                        input: feed, cache: cache, parameters: parameters, context: context)
+                let iterator: TokenIterator
+                if let opening, let vocabulary {
+                    // The first tokens are held to the word being typed, or to one of the machine's values, so the model continues rather than invents.
+                    let processor: any LogitProcessor =
+                        if let choice {
+                            TokenChoice(vocabulary: vocabulary, choices: choice.choices)
+                        } else {
+                            TokenHealing(
+                                vocabulary: vocabulary, owed: opening.owed,
+                                wordComplete: opening.isWordComplete,
+                                mayEnd: opening.mayEnd)
+                        }
+                    iterator = try TokenIterator(
+                        input: feed, model: context.model, cache: cache, processor: processor,
+                        sampler: parameters.sampler(), maxTokens: parameters.maxTokens)
+                } else {
+                    iterator = try TokenIterator(
+                        input: feed, model: context.model, cache: cache, parameters: parameters)
                 }
-                // The first tokens are held to the word being typed, or to one of the machine's values, so the model continues rather than invents.
-                let processor: any LogitProcessor =
-                    if let choice {
-                        TokenChoice(vocabulary: vocabulary, choices: choice.choices)
-                    } else {
-                        TokenHealing(
-                            vocabulary: vocabulary, owed: opening.owed, wordComplete: opening.isWordComplete,
-                            mayEnd: opening.mayEnd)
-                    }
-                let iterator = try TokenIterator(
-                    input: feed, model: context.model, cache: cache, processor: processor,
-                    sampler: parameters.sampler(), maxTokens: parameters.maxTokens)
                 return generateTask(
                     promptTokenCount: feed.text.tokens.size, modelConfiguration: context.configuration,
-                    tokenizer: context.tokenizer, iterator: iterator
-                ).0
+                    tokenizer: context.tokenizer, iterator: iterator)
             }
         } catch is CancellationError {
             // A cancelled pass answers a line that is gone, and nothing is drawn for it either way.
@@ -292,6 +389,9 @@ public actor MLXCandidateScorer: CandidateScoring, PassShowing {
             case .toolCall: break
             }
         }
+        // The decode stops before the pass ends, so a release never empties weights a step is still reading.
+        generation.cancel()
+        await generation.value
         if let info {
             Self.log.debug(
                 "PASS prompt=\(info.promptTokenCount) promptMs=\(Int(info.promptTime * 1_000)) generated=\(info.generationTokenCount) generateMs=\(Int(info.generateTime * 1_000))"
@@ -503,7 +603,11 @@ public actor MLXCandidateScorer: CandidateScoring, PassShowing {
 
     /// Every token the model is judged on with its log-probability, which is where a score comes from.
     public func judgedTokens(of candidate: String, following context: String) async -> [JudgedToken] {
+        bufferCache.hold()
+        defer { bufferCache.clear() }
         guard let container, !Task.isCancelled else { return [] }
+        beginPass()
+        defer { endPass() }
         let bytes = vocabulary?.bytes ?? []
         return await container.perform { loaded in
             Self.judge(candidate, following: context, bytes: bytes, with: loaded)
@@ -545,4 +649,35 @@ public actor MLXCandidateScorer: CandidateScoring, PassShowing {
         guard !context.isEmpty, candidate.lowercased().hasPrefix(context.lowercased()) else { return "" }
         return String(candidate.prefix(context.count))
     }
+}
+
+extension WeightLoading<ModelContainer> {
+    /// Builds through mlx-swift-lm once, then swaps weights in place so a reload never quantises fresh arrays. See `Docs/performance.md`.
+    static let mlx = WeightLoading(
+        build: { try await MLXCandidateScorer.buildContainer(from: $0) },
+        refill: { container, directory in
+            try await container.perform { context in
+                var weights = [String: MLXArray]()
+                var metadata = [String: String]()
+                let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil)
+                while let url = files?.nextObject() as? URL {
+                    guard url.pathExtension == "safetensors" else { continue }
+                    let (read, readMetadata) = try loadArraysAndMetadata(url: url)
+                    weights.merge(read) { _, new in new }
+                    if metadata.isEmpty { metadata = readMetadata }
+                }
+                weights = context.model.sanitize(weights: weights, metadata: metadata)
+                try context.model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+                eval(context.model)
+            }
+        },
+        empty: { container in
+            await container.perform { context in
+                // A placeholder of the same shape that is never evaluated holds no buffer, and a refill still checks every shape.
+                let placeholders = context.model.parameters().mapValues {
+                    MLXArray.zeros($0.shape, dtype: $0.dtype)
+                }
+                context.model.update(parameters: placeholders)
+            }
+        })
 }

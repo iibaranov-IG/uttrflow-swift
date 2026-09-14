@@ -35,20 +35,23 @@ public actor WhisperKitBackend: TranscriptionBackend {
 
         do {
             // `download: false`, so a missing model is a clear error rather than a silent stall.
-            kit = LoadedKit(
-                try await WhisperKit(
-                    WhisperKitConfig(
-                        model: model.variant,
-                        modelFolder: modelFolder.path,
-                        // Tokenizer search stays in the model's directory, never the Hugging Face cache.
-                        tokenizerFolder: modelFolder,
-                        verbose: false,
-                        logLevel: .error,
-                        prewarm: true,
-                        load: true,
-                        download: false
-                    )
-                ))
+            let whisper = try await WhisperKit(
+                WhisperKitConfig(
+                    model: model.variant,
+                    modelFolder: modelFolder.path,
+                    // Tokenizer search stays in the model's directory, never the Hugging Face cache.
+                    tokenizerFolder: modelFolder,
+                    verbose: false,
+                    logLevel: .error,
+                    prewarm: true,
+                    load: true,
+                    download: false
+                )
+            )
+            // Detection may only answer in a language the product transcribes, so Hindi is never heard as Urdu.
+            whisper.textDecoder = LanguageHeldDecoder(
+                wrapping: whisper.textDecoder, languages: LanguageCode.transcribed)
+            kit = LoadedKit(whisper)
         } catch {
             throw .modelLoadFailed(description: error.localizedDescription)
         }
@@ -143,7 +146,7 @@ extension FileSystemSpeechModelStore {
     }
 }
 
-/// Owns the loaded recogniser; `WhisperKit` is not `Sendable`, and the actor above serialises every call.
+/// Owns the loaded recogniser; `WhisperKit` is not `Sendable`, and `BackedSpeechEngine` admits one call at a time.
 private final class LoadedKit: @unchecked Sendable {
     private let kit: WhisperKit
 
@@ -166,7 +169,21 @@ private final class LoadedKit: @unchecked Sendable {
         )
         // Reassigned on every call, including to nothing, so a rule never outlives the prompt it was measured for.
         kit.textDecoder.logitsFilters = Self.rules(for: options, tokenizer: tokenizer)
+        // Reassigned with the rules, so word timings always read the rows this call's prompt left them.
+        kit.segmentSeeker = Self.seeker(for: options, tokenizer: tokenizer)
         return try await kit.transcribe(audioArray: samples, decodeOptions: options)
+    }
+
+    /// The segment seeker for this call, lined up past the prompt that precedes the transcript in the alignment weights.
+    private static func seeker(
+        for options: DecodingOptions, tokenizer: (any WhisperTokenizer)?
+    ) -> any SegmentSeeking {
+        guard let tokenizer else { return SegmentSeeker() }
+        return DecoderPrefill(
+            promptTokens: options.promptTokens,
+            specialTokenBegin: tokenizer.specialTokens.specialTokenBegin,
+            isMultilingual: !tokenizer.allLanguageTokens.isEmpty
+        ).segmentSeeker()
     }
 
     /// The timestamp rules a prompted decode loses, and nothing at all without a prompt, where WhisperKit's own still fire.

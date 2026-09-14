@@ -320,7 +320,9 @@ public enum DiagnosticsPresenter {
     /// The words the floating button already uses for these moments, so the row is recognised.
     static func title(for stage: PipelineStage) -> String {
         switch stage {
+        case .microphoneOpen: "Opening the microphone"
         case .capture: "Recording"
+        case .drain: "Finishing the piece already under way"
         case .transcription: "Transcribing"
         case .correction: "Checking the dictionary"
         case .transformation: "Tidying up"

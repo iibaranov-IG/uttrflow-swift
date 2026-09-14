@@ -14,6 +14,8 @@ final class FakeClipboard: ClipboardSource, Sendable {
         var html: String?
         var picture: (data: Data, width: Int, height: Int)?
         var application: String?
+        var markers: PasteboardMarkers = []
+        var landsDuringMarkers: (text: String, markers: PasteboardMarkers)?
         var reads = 0
         var contentReads = 0
     }
@@ -23,7 +25,8 @@ final class FakeClipboard: ClipboardSource, Sendable {
     /// Writes to the clipboard as another application would: the contents change and the count goes up.
     func write(
         _ text: String?, html: String? = nil,
-        picture: (data: Data, width: Int, height: Int)? = nil, from application: String? = nil
+        picture: (data: Data, width: Int, height: Int)? = nil, from application: String? = nil,
+        marked markers: PasteboardMarkers = []
     ) {
         state.withLock {
             $0.count += 1
@@ -31,6 +34,7 @@ final class FakeClipboard: ClipboardSource, Sendable {
             $0.html = html
             $0.picture = picture
             $0.application = application
+            $0.markers = markers
         }
     }
 
@@ -52,6 +56,23 @@ final class FakeClipboard: ClipboardSource, Sendable {
     }
 
     func html() -> String? { state.withLock(\.html) }
+
+    /// Arms a write that lands while the watcher is reading the markers of the copy before it.
+    func writeWhileMarkersAreRead(_ text: String, marked markers: PasteboardMarkers = []) {
+        state.withLock { $0.landsDuringMarkers = (text, markers) }
+    }
+
+    func markers() -> PasteboardMarkers {
+        state.withLock {
+            if let landing = $0.landsDuringMarkers {
+                $0.landsDuringMarkers = nil
+                $0.count += 1
+                $0.text = landing.text
+                $0.markers = landing.markers
+            }
+            return $0.markers
+        }
+    }
 
     /// K4 — a picture the test put on the clipboard.
     func image() -> (data: Data, width: Int, height: Int)? { state.withLock(\.picture) }
@@ -409,10 +430,40 @@ struct PasteboardWatcherTests {
         await task.value
     }
 
-    /// Two hundred milliseconds, because the gap between ⌘C and ⇧⌘V is a hand movement.
-    @Test("polls often enough to keep up with the gesture")
+    /// The panel catches up as it opens, so the poll is set by battery rather than by the gesture. See `Docs/performance.md`.
+    @Test("polls no more than twice a second")
     func interval() {
-        #expect(PasteboardWatcher.pollInterval == .milliseconds(200))
+        #expect(PasteboardWatcher.pollInterval >= .milliseconds(500))
+    }
+
+    @Test("lets the system move a poll by a fifth of the interval, so it can coalesce wakeups")
+    func tolerance() {
+        #expect(PasteboardWatcher.tolerance(for: .milliseconds(500)) == .milliseconds(100))
+        #expect(PasteboardWatcher.tolerance(for: .milliseconds(1)) < .milliseconds(1))
+    }
+
+    @Test("catches up on a copy made since the last poll, and hands it once")
+    func catchUp() async {
+        let clipboard = FakeClipboard()
+        let watcher = watcher(clipboard)
+        clipboard.write("copied a moment before the panel opened")
+        let handed = Mutex<[String]>([])
+
+        await watcher.catchUp { noticed in handed.withLock { $0.append(noticed.clip.text) } }
+
+        #expect(handed.withLock { $0 } == ["copied a moment before the panel opened"])
+        #expect(await watcher.newClip(at: noon) == nil)
+    }
+
+    @Test("hands nothing when catching up finds no new copy")
+    func catchUpWithNothingNew() async {
+        let clipboard = FakeClipboard()
+        let watcher = watcher(clipboard)
+        let handed = Mutex(0)
+
+        await watcher.catchUp { _ in handed.withLock { $0 += 1 } }
+
+        #expect(handed.withLock { $0 } == 0)
     }
 
     /// Left to itself it reads the real clock, which is what the app gets.

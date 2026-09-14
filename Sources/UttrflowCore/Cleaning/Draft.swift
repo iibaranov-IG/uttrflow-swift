@@ -71,8 +71,8 @@ public struct Draft: Sendable, Equatable {
             return true
         }
 
-        /// Whether the word is a line break, a paragraph break or a bullet rather than something said.
-        public var isLayoutMark: Bool { text.hasPrefix("\n") || text == Draft.bullet }
+        /// Whether the word is a line break, a paragraph break, a bullet or an item number rather than something said.
+        public var isLayoutMark: Bool { text.hasPrefix("\n") || text == Draft.bullet || isListMark }
 
         /// Whether the word opens a list item, with a bullet or with a number; neither takes a full stop.
         public var isListMark: Bool {
@@ -82,6 +82,12 @@ public struct Draft: Sendable, Equatable {
             let digits = mark.dropLast(Draft.numberStop.count)
             return !digits.isEmpty && digits.allSatisfy(\.isNumber)
         }
+    }
+
+    /// Whether the words after the last paragraph or list mark are a list item, which takes no full stop.
+    public var endsInListItem: Bool {
+        let marks = presentIndices.map { words[$0] }.filter(\.isLayoutMark)
+        return marks.last(where: { $0.text.hasPrefix("\n\n") || $0.isListMark })?.isListMark ?? false
     }
 
     /// The dash and space a list item begins with, after the line break that starts it.

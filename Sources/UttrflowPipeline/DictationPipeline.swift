@@ -60,9 +60,15 @@ public actor DictationPipeline {
     private var earlySpans: [Span] = []
     private var earlyCut = 0
     private var earlyWork: Task<Void, Never>?
+    /// Whether a piece is being recognised or tidied right now, which is what makes the drain a wait worth timing.
+    private var pieceInFlight = false
     private var earlyContext: AppContext?
+    /// How many early screen reads have come back and been kept or dropped, so a test can wait for the last one.
+    private(set) var earlyReadsSettled = 0
     /// Ranked once per dictation, against the screen it began on, and given to every piece.
     private var dictationWords: [String]?
+    /// Detected by the first piece that reports one, and hinted to every later piece. See `Docs/early-transcription.md`.
+    private var dictationLanguage: LanguageCode?
 
     /// What the clean-up steps did to each piece of the dictation under way, reported as one when it ends.
     private var cleaningRecords: [CleaningRecord] = []
@@ -137,6 +143,9 @@ public actor DictationPipeline {
     /// Whether the recogniser has loaded and the next dictation will not wait for it.
     public private(set) var isReady = false
 
+    /// Whether `prepare` is loading the recogniser right now, which is when a new dictation is refused.
+    public private(set) var isLoading = false
+
     /// Every state the pipeline passes through, from now on.
     public func states() -> AsyncStream<DictationState> {
         observers.makeStream(startingWith: state)
@@ -144,6 +153,8 @@ public actor DictationPipeline {
 
     /// Loads the speech model so the first dictation is not the slow one. See `Docs/startup.md`.
     public func prepare() async {
+        isLoading = true
+        defer { isLoading = false }
         do {
             try await speech.prepare()
             isReady = true
@@ -170,13 +181,18 @@ public actor DictationPipeline {
     /// Begins listening. Does nothing if a dictation is already under way.
     public func startRecording() async {
         guard !isBusy else { return }
+        // Said rather than recorded: the words would wait behind the load, under a button saying nothing.
+        guard !isLoading else { return transition(to: .failed(.stillLoading)) }
         hasTurn = true
         defer { hasTurn = false }
 
         generation += 1
         let mine = generation
         do {
-            try await capture.start()
+            // Measured because the user is already speaking: nothing is heard until this returns.
+            try await metrics.measuring(.microphoneOpen, clock: clock) { [capture] in
+                try await capture.start()
+            }
             guard !wasCancelled(mine) else {
                 // Cancelled while the microphone was opening: close it rather than listen on.
                 await capture.cancel()
@@ -306,6 +322,7 @@ public actor DictationPipeline {
         earlyCut = 0
         earlyContext = nil
         dictationWords = nil
+        dictationLanguage = nil
         earlyWork = Task { [cleaner = runningCleaner, overrides = runningOverrides] in
             let seeing = await self.earlyContextRead(mine)
             guard self.isStillRunning(mine) else { return }
@@ -328,6 +345,9 @@ public actor DictationPipeline {
             else { continue }
 
             let seeing = await earlyContextRead(mine)
+            // From recognition to tidied, so a key released during either is charged to the drain.
+            pieceInFlight = true
+            defer { pieceInFlight = false }
             let heard: Transcription?
             do {
                 heard = try await transcribe(
@@ -362,6 +382,8 @@ public actor DictationPipeline {
     private func earlyContextRead(_ mine: Int) async -> AppContext {
         if let earlyContext { return earlyContext }
         let read = await readContext()
+        // Counted before the decision below, which runs without a suspension, so a waiter sees it made.
+        earlyReadsSettled += 1
         // A read the user cancelled belongs to no dictation: the one now under way read its own screen.
         guard isStillRunning(mine) else { return read }
         earlyContext = read
@@ -403,8 +425,16 @@ public actor DictationPipeline {
 
         // A piece under way is finished, not thrown away: its words are needed either way.
         earlyWork?.cancel()
-        await earlyWork?.value
+        if let earlyWork {
+            // Measured only where a piece really is in flight, so working ahead of nothing gains no row.
+            if pieceInFlight {
+                await metrics.measuring(.drain, clock: clock) { await earlyWork.value }
+            } else {
+                await earlyWork.value
+            }
+        }
         earlyWork = nil
+        pieceInFlight = false
         var spans = earlySpans
         var cut = earlyCut
         let earlyContext = self.earlyContext
@@ -489,7 +519,8 @@ public actor DictationPipeline {
         if state == .transcribing { transition(to: .tidying) }
         let joining = SituationResolver.resolve(
             from: appContext ?? AppContext(), overrides: runningOverrides)
-        let whole = PieceJoiner.join(pieces, under: .standard(for: joining.destination))
+        let joined = PieceJoiner.join(pieces, under: .standard(for: joining.destination))
+        let whole = await finishMessage(joined, going: joining, seeing: appContext ?? AppContext())
 
         // Inserting a blank would delete the user's selection, so it is refused like silence.
         guard !whole.cleaned.text.isBlank else {
@@ -503,6 +534,7 @@ public actor DictationPipeline {
 
         let changes = AppliedChanges(
             corrections: whole.corrected.corrections, snippets: expanded.snippets,
+            entriesTaken: whole.cleaned.entriesTaken,
             // The unrewritten sentence, which is the space the corrections' word ranges index.
             spokenWords: whole.heard.text.spokenWords.count)
         guard
@@ -537,13 +569,16 @@ public actor DictationPipeline {
     ) async throws -> Transcription? {
         let slice =
             AudioSamples(samples: Array(audio.samples[window]), sampleRate: audio.sampleRate) ?? .empty
+        // One speaker does not change language between two halves of one utterance, so only the first piece detects.
+        let language = dictationLanguage
         let heard = try await metrics.measuring(.transcription, clock: clock) {
             try await withStageTimeout(StageTimeout.transcription, clock: clock) {
                 [speech] () async throws -> Heard in
                 do {
                     return Heard.words(
                         try await speech.transcribe(
-                            slice, options: TranscriptionOptions(vocabulary: words)))
+                            slice,
+                            options: TranscriptionOptions(languageHint: language, vocabulary: words)))
                 } catch SpeechEngineError.nothingHeard, SpeechEngineError.audioTooShort {
                     // Only when there is nothing else: alone, silence is refused below.
                     guard window != audio.samples.indices else { throw SpeechEngineError.nothingHeard }
@@ -556,6 +591,7 @@ public actor DictationPipeline {
             throw SpeechEngineError.transcriptionFailed(description: "the recogniser did not answer")
         }
         guard case .words(let transcription) = heard, !transcription.isBlank else { return nil }
+        if dictationLanguage == nil { dictationLanguage = transcription.detectedLanguage?.code }
         return transcription
     }
 
@@ -606,7 +642,8 @@ public actor DictationPipeline {
         // Every piece of a dictation is tidied against the one screen read, so all see one situation.
         let request = TransformationRequest(
             transcription: transcription.saying(corrected), context: appContext, profile: profile,
-            situation: SituationResolver.resolve(from: appContext, overrides: runningOverrides))
+            situation: SituationResolver.resolve(from: appContext, overrides: runningOverrides),
+            scope: .piece)
         // Not `.rules`: no pass ran over these words, and a record that says otherwise cannot be read.
         let untidied = TransformationResult(text: text, producedBy: .untidied)
 
@@ -624,6 +661,22 @@ public actor DictationPipeline {
         } catch {
             return untidied
         }
+    }
+
+    /// Asks the cleaner for the message's own passes once over the joined pieces; untidied words stay as they were.
+    private func finishMessage(
+        _ joined: Piece, going situation: Situation, seeing appContext: AppContext
+    ) async -> Piece {
+        guard joined.cleaned.producedBy != .untidied else { return joined }
+        let request = TransformationRequest(
+            transcription: joined.heard.saying(joined.corrected), context: appContext, profile: profile,
+            situation: situation)
+        let finished = await runningCleaner.finishMessage(joined.cleaned.text, for: request)
+        return Piece(
+            heard: joined.heard, corrected: joined.corrected,
+            cleaned: TransformationResult(
+                text: finished, producedBy: joined.cleaned.producedBy,
+                cleaning: joined.cleaned.cleaning, entriesTaken: joined.cleaned.entriesTaken))
     }
 
     /// Expands the user's snippets, treating a blank expansion as nothing to do.
@@ -713,9 +766,10 @@ public actor DictationPipeline {
     private func count(_ changes: AppliedChanges) async {
         guard !changes.isEmpty else { return }
 
-        // Once per entry and in one batch: the store counts dictations an entry was applied to, not words.
+        // Once per entry and in one batch: the store counts dictations an entry was applied to, not words, by either path.
         var counted: Set<UUID> = []
-        let entries = changes.corrections.map(\.entryID).filter { counted.insert($0).inserted }
+        let entries = (changes.corrections.map(\.entryID) + changes.entriesTaken)
+            .filter { counted.insert($0).inserted }
         if !entries.isEmpty { try? await learner.recordUse(ofEntries: entries) }
 
         guard !changes.snippets.isEmpty else { return }

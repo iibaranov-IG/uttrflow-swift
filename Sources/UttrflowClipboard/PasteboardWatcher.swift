@@ -7,8 +7,13 @@ private import Synchronization
 
 /// Notices when the user copies something, by polling, which is the only mechanism macOS offers.
 public actor PasteboardWatcher {
-    /// How often the change count is read, set by how fast a hand moves from ⌘C to ⇧⌘V.
-    public static let pollInterval = Duration.milliseconds(200)
+    /// How often the change count is read; the panel catches up as it opens, so this is set by battery. See `Docs/performance.md`.
+    public static let pollInterval = Duration.milliseconds(500)
+
+    /// How far the system may move one poll to coalesce it with other wakeups: a fifth of the interval.
+    static func tolerance(for interval: Duration) -> Duration {
+        interval / 5
+    }
 
     /// How long an announcement stays armed, so a write that never happened cannot sit waiting.
     static let announcementLifetime: Double = 2
@@ -95,6 +100,12 @@ public actor PasteboardWatcher {
             return nil
         }
 
+        // A copy its writer marked as not for history is never recorded, text or picture.
+        let markers = source.markers()
+        guard markers.allowsRecording else { return nil }
+        // A write between the reads pairs one copy with another's markers; the next tick reads it whole.
+        guard source.changeCount() == count else { return nil }
+
         // K4 — a picture, asked first because the branch below returns for anything textless.
         if copied == nil, let picture = source.image() {
             return NoticedClip(
@@ -113,13 +124,16 @@ public actor PasteboardWatcher {
         // Before the classifier, which reads the whole string: the store would refuse this anyway.
         guard fitsTheBound(text, html) else { return nil }
 
-        let kind = ClipKindDetector.kind(of: text)
+        // A concealed copy is a password to its writer, whatever its shape. See Docs/clipboard-secrets.md.
+        let classified =
+            markers.contains(.concealed)
+            ? ClipClassification(kind: .secret, language: nil) : ClipKindDetector.classification(of: text)
         return NoticedClip(
             clip: Clip(
-                text: text, kind: kind, copiedAt: date,
+                text: text, kind: classified.kind, copiedAt: date,
                 source: source.frontmostApplicationName(),
                 // Only of a clip already judged to be code, so prose never pays for the detector.
-                language: kind == .code ? CodeLanguage.detect(text) : nil,
+                language: classified.language,
                 // E — kept beside the plain form, never instead of it.
                 richText: html))
     }
@@ -135,9 +149,16 @@ public actor PasteboardWatcher {
     /// Watches until cancelled, handing each new clip to `handle` in order.
     public func run(handing handle: @Sendable (NoticedClip) async -> Void) async {
         while true {
-            do { try await Task.sleep(for: interval) } catch { break }
-            if let clip = newClip(at: now()) { await handle(clip) }
+            do {
+                try await Task.sleep(for: interval, tolerance: Self.tolerance(for: interval))
+            } catch { break }
+            await catchUp(handing: handle)
         }
+    }
+
+    /// Reads the clipboard now rather than at the next poll, so a panel opening shows a copy made a moment before.
+    public func catchUp(handing handle: @Sendable (NoticedClip) async -> Void) async {
+        if let clip = newClip(at: now()) { await handle(clip) }
     }
 }
 

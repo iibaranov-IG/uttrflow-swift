@@ -44,4 +44,19 @@ stopped when the panel closed demonstrated a mechanism and left out the payoff.
   width in, arrangement out, and the clock only draws.
 - The animation is a pure function of the clock, so the page can redraw underneath it (on
   every keystroke in a search field) without the loop stuttering.
-- Paused when the window is not visible, which is where this card spends most of its life.
+- Moves only while its window is key in the active app and some of the card itself is inside the
+  scroll view's bounds and on a display, per `WindowAttention`, and only while
+  `MotionBudget` finds no Reduce Motion, Low Power Mode or serious thermal pressure; otherwise
+  it rests on the panel open with the address row chosen. Its clock wakes only when the drawing
+  changes, and at most 30 times a second while the panel moves (`ClipboardDemonstrationMoments`).
+  See `Docs/performance.md`.
+
+## Colours
+
+`Sources/Uttrflow/Brand/BrandPalette.swift` is the only place a colour is defined. It groups
+every value by role — brand teal, brand purple, surfaces, lines, text tones and semantic
+colours — each as a dark and light pair where the appearance changes it. Views name a palette
+member, through aliases such as `Color.panelAccent` or `Color.mainBackground`; none writes a hex.
+Where two views draw the same value they point at the same member, so the dock's live accent
+and the quick panel's accent cannot drift apart. `NSColor.orbit(_:)` in `OrbitPalette.swift`
+resolves a pair per appearance. `BrandPaletteTests` pins the primary teal and secondary purple.

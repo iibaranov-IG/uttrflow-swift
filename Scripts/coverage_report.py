@@ -68,10 +68,6 @@ EXCLUDED_FILES = {
         "rules it holds are tested without it — HotkeyRecogniser against every shape of "
         "binding, and TapDisableWindow against a tap the system keeps switching off"
     ),
-    "UttrflowInput/ActivationMonitor.swift": (
-        "wires the keyboard source to the recogniser; the source needs a window server and "
-        "the recogniser is tested directly, so there is nothing here a test could reach"
-    ),
     "UttrflowClipboard/CodeFormatting+System.swift": "spawns another program and pipes bytes through it",
     "UttrflowPredict/EnvironmentReading+System.swift": (
         "runs git, reads directories and scans PATH; what is done with the answers — which "
@@ -107,13 +103,13 @@ EXCLUDED_FILES = {
     "Uttrflow/Sidebar/SidebarView.swift": "SwiftUI, drawn from a tested presentation",
     "Uttrflow/Main/HomePageView.swift": "SwiftUI, drawn from a tested presentation",
     "Uttrflow/Main/ClipboardDemonstration.swift": (
-        "SwiftUI; the two things it decides are ClipboardDemonstrationPhase, which says what "
-        "is drawn at an instant, and ClipboardDemonstrationMetrics, which chooses the "
-        "arrangement from a width, and both are tested"
+        "SwiftUI; what it decides is in ClipboardDemonstrationPhase, which says what is drawn "
+        "at an instant, ClipboardDemonstrationMoments, which says when to wake, and "
+        "ClipboardDemonstrationMetrics, which chooses the arrangement from a width, all tested"
     ),
     "Uttrflow/Main/WindowVisibility.swift": (
-        "asks a real NSWindow whether it is on screen; there is nothing to decide "
-        "here that a test could reach without a window server"
+        "reads a real NSWindow and NSApp for the facts WindowAttention decides from, which is "
+        "tested; nothing here a test could reach without a window server"
     ),
     "Uttrflow/Main/OrbitStage.swift": "SwiftUI, drawn from a tested presentation and a tested ring",
     "Uttrflow/Main/ApplicationIconSource+System.swift": "asks the system for another app's icon",

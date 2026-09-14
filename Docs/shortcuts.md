@@ -63,6 +63,34 @@ had missed. It polled a source that cannot see Fn, read "up" while Fn was held, 
 the dictation the instant it started. It is gone: the tap delivers clean pairs, and the one
 release worth guaranteeing is the one below.
 
+## Modifiers bound alone begin other shortcuts
+
+A binding made only of modifiers, such as ⌃⌘⌥, is the start of every shortcut on those
+modifiers: ⌃⌘⌥K in another app holds exactly the chord before K arrives. The tap only listens,
+so that app still gets K; what this app must not do is dictate as well.
+
+`HotkeyRecogniser` withdraws such a press. A key typed while any modifier is held, or a modifier
+the binding does not have, marks the hold as used by another shortcut: a press already reported
+becomes `HotkeyEvent.cancelled` rather than `.released`, and nothing counts again until every
+modifier is up. So ⌃⌥⇧⌘K on a ⌃⌘⌥ binding reports one press and one withdrawal, not a press for
+each time ⇧ comes and goes. It applies only to holds of modifiers; Fn is read from its own flag
+and a combination such as ⌥Space or ⇧⌘V already names its key.
+
+A withdrawal alone would still open the microphone and play the start cue before K arrives, so
+`DictationController` also holds such a press back for `modifierSettle` — the same 200 ms as the
+minimum hold — before acting on it:
+
+- **Withdrawn inside the settle:** nothing happens at all. No microphone, no cue, no insertion.
+- **Held past the settle:** the press counts, measured from when the keys went down, so the
+  minimum hold and the double tap keep their meaning.
+- **Released inside the settle:** in hold-to-talk it is a tap, counted towards a double tap
+  without opening the microphone; in press-to-toggle it toggles on the release.
+- **Withdrawn after the settle:** the dictation that press opened is cancelled and nothing is
+  inserted. A press that closed a toggled dictation has already finished it and is not undone.
+
+The cost is that a modifier-only binding starts up to 200 ms later than it did. Bindings with a
+key, and Fn, start as they always have.
+
 ## The release nobody else will send
 
 `ActivationMonitor.stop()` yields a release when it is stopped mid-hold, because a hold
@@ -84,6 +112,27 @@ held modifier or Fn at all.
 
 So delivery is a property of the shortcut: most are **observed** through the tap, and one is
 **claimed** through Carbon.
+
+## Re-registering a claimed shortcut
+
+Carbon refuses a combination this process already holds, with `-9878`
+(`eventHotKeyExistsErr`), and does not refuse one another process holds. Measured from a test
+process: registering ⇧⌘V twice answers `0` then `-9878`, and `0` again once the first is
+unregistered. A refused registration is not consumed, so the key reaches the frontmost app —
+for ⇧⌘V, a paste without formatting.
+
+Every change to the shortcuts, and every activation while one is unarmed, stops all the
+claimed monitors and registers them again. On the main thread `stop()` unregisters before it
+returns, so that sequence cannot collide with itself. Off the main thread `stop()` takes the
+registration out at once and queues the Carbon call for the main thread; the next
+registration runs that queue before it registers. Without the queue, a rebind that ran before
+the hop was refused with `-9878`, and the hop then removed the old registration too, leaving
+the key held by nobody. `CarbonHotkeyLifecycleTests` drives both orders through the real
+monitor.
+
+Whether a registration that succeeded is delivered is a window-server question no test here
+can answer: a key event posted from a test process did not fire a Carbon hot key even with a
+single registrant, so delivery is checked by pressing the key on a real build.
 
 ## What a shortcut is for
 
@@ -108,7 +157,11 @@ Everything that decides anything. `HotkeyRecogniser`, `SettingsShortcutRecorder`
 and the settings decoding are pure values driven by `KeyStroke` sequences, with no window
 server involved. `SystemKeyboard` and `ActivationMonitor` are on the coverage exclusion list
 because they only create the tap and pass strokes on — what is made of those strokes is tested
-against every shape of binding.
+against every shape of binding. How a stroke is passed on is tested too: `Delivery` holds the sink
+as a struct around the closure, never the bare closure, because a closure read out of a `Mutex` is
+re-wrapped on every read and the stack deepened by each keystroke until the tap's thread overflowed.
+`SystemKeyboardDeliveryTests` checks that the 500th stroke, and the release after it, cost no more
+stack than the first.
 
 The parts that cannot be unit-tested are exercised by posting synthetic `CGEvent`s at the real
 app and watching the recording window appear. That proves the tap, the Accessibility grant and
