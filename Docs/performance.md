@@ -277,6 +277,32 @@ drop in a loop. A reload that holds for thirty minutes starts the wait over.
 
 The speech model is left alone under pressure, for the reasons above.
 
+## How the budget is enforced
+
+Both budgets above are checked, not only stated. `make perf-budget` runs in `make verify`, needs
+no build, no model and no window, and reads the source for the ways a budget has been broken
+before. `Scripts/perf_budget_audit.py` holds the rules and prints every allowance with its reason
+on every run:
+
+| check | fails when |
+|---|---|
+| wakeups | a repeating `Timer`, repeating `DispatchSource` timer, display link or sleeping loop in product code has an interval under 500 ms, or one the audit cannot resolve, and is not listed with the reason it is not an idle cost |
+| priority | the suggestion and local-model modules ask for more than utility priority, detach a task without one, or the app uses the suggestion model outside a `Discretionary` wrapper |
+| motion | a `TimelineView`, `repeatForever`, phase or keyframe animator or repeating symbol effect reads neither `MotionBudget` nor `WindowAttention`, or is paused by a literal |
+| cache | a model pass (`perform`, `generate`, `TokenIterator`, `ChatSession`) sits in no function that caps MLX's cache and clears it on exit, a `release()` does not clear it, or the cap is over 256 MB |
+| counters | `ResourceBudget`'s limits differ from the table above |
+
+`--self-test` injects one violation per check into the tree as read and fails unless the audit
+catches it, so a rule that has stopped matching the code is found rather than trusted. A breach
+already on `main` is listed under the issue that fixes it, and fails as stale once it is gone.
+
+Memory itself can only be read with the models loaded, so `make perf-budget-models` runs
+`uttrflow-bakeoff gpu-memory --release` and `uttrflow-bakeoff profile` and each exits non-zero
+when a reading is over its line: every settled moment of a profile against the idle line, its
+peak against a dictation's, each pass's peak and settled footprint against the suggestion lines,
+and the footprint a second after a release against the idle line. `ResourceBudget` in
+`UttrflowEval` is the one judge both use.
+
 ## Processor
 
 Memory answers "will it fit". This is the other half — what it costs to run — and a table
@@ -828,7 +854,7 @@ The GPU buffers are not part of it. It is CPU bookkeeping, paid on every call to
 so it grew through a day of ordinary use.
 
 **Reloads no longer quantise.** `ReloadableWeights` builds the modules through
-`loadModelContainer` on the first load only. A release keeps the modules and swaps every
+`QuantizedLoad` on the first load only. A release keeps the modules and swaps every
 weight for an unevaluated `zeros` placeholder of the same shape, which holds no buffer; a
 reload reads the safetensors, runs the model's `sanitize`, and assigns them with
 `update(parameters:verify: .all)`, so every shape is still checked. Nothing on that path makes a
@@ -854,11 +880,31 @@ release crept up with them. After, the count stays at what the first load leaves
 about a second faster because no module is built, and the same fixed prompt gives the same answer
 after every reload. MLX's active memory after a release is still 0 MB (`gpu-memory --release`).
 
+**The first load does not quantise either.** `QuantizedLoad` creates the model from the same
+type registry, reads the safetensors headers, and swaps each linear layer that the snapshot stores
+with scales in a floating type, and that the configuration quantizes, for a `QuantizedLinear` of
+unevaluated zeros before `loadWeights` runs; any other layer is left to the library, so the quantiser
+skips it and the stored weights replace the zeros with the same shape checks. It then evaluates
+MLX's global random key, which every random initial weight split lazily into a chain of siblings.
+Only the embedding still goes through the quantiser, because `QuantizedEmbedding` has no
+initializer that takes arrays. The clean-up model loads through the same path. Measured on top of
+the table above, with the same command:
+
+| | leaks | leaked bytes | footprint after the last release |
+|---|---|---|---|
+| reloadable weights alone, first load | 10,808 | 2.06 MB | 364 MB |
+| reloadable weights alone, 5 reloads | 10,950 | 2.09 MB | 365 MB |
+| with `QuantizedLoad`, first load | 75 | 14 KB | 339 MB |
+| with `QuantizedLoad`, 5 reloads | 75 | 14 KB | 340 MB |
+
+The same fixed prompt gives the same answer throughout.
+
 Other ways round it, and why they were not taken. Evaluating the quantised arrays before they are
 replaced would break the cycle, but `loadWeights` gives no moment between the two, and evaluating
 them would quantise the randomly initialised full-precision weights — gigabytes of work thrown
 away. No loader option skips the quantiser: `LLMModelFactory` always passes the configuration's
-quantisation to `loadWeights`, and without it the stored `scales` fail verification. Releasing
+quantisation to `loadWeights`, and without it the stored `scales` fail verification, which is why
+`QuantizedLoad` builds the quantized layers itself instead. Releasing
 less often would only slow the growth, and would hold 3 GB longer on the small Macs the idle
 release exists for.
 
